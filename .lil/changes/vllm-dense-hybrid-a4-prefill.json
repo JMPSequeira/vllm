@@ -11,5 +11,6 @@
     "Missing or invalid A4 calibration and unsupported A4 input widths retain A16. Encoder-decoder models and token redistribution configurations without a matching row-order contract reject hybrid mode."
   ],
   "pull_requests": [],
+  "authors": ["lukealonso"],
   "requires": []
 }
