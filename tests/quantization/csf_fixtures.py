@@ -22,10 +22,15 @@ class TensorView:
         return self.tensor[extent]
 
 
-def matrix(rows, channels, *, group_size, seed):
+def matrix(rows, channels, *, group_size, seed, finite_scales=False):
     """Return a source projection and its uncompressed reference scale bytes."""
+    from b12x.loader._csf_blocks import export_csf_blocks
+
     columns = channels // group_size
-    bases = ((np.arange(rows) + seed) % 190 + 20).astype(np.uint8)
+    bases = (
+        (np.arange(rows) + seed) % (16 if finite_scales else 190)
+        + (43 if finite_scales else 20)
+    ).astype(np.uint8)
     offsets = (np.arange(rows * columns) + seed) % (2 if group_size == 32 else 16)
     offsets = offsets.reshape(rows, columns).astype(np.uint8)
     logical = bases[:, None] + offsets
@@ -39,6 +44,8 @@ def matrix(rows, channels, *, group_size, seed):
         ]
     ).astype(np.uint32)
     values = (np.arange(len(positions), dtype=np.uint32) * 7 + seed) % 256
+    if finite_scales and group_size == 16:
+        values %= 127
     logical.flat[positions] = values.astype(np.uint8)
     packed = (
         np.packbits(offsets, axis=1, bitorder="little")
@@ -51,8 +58,13 @@ def matrix(rows, channels, *, group_size, seed):
     weight = (torch.arange(rows * channels // 2) + seed).to(torch.uint8)
     source = CsfMatrix(
         weight=TensorView(weight.reshape(rows, channels // 2)),
-        fixed=torch.from_numpy(fixed),
-        exceptions=torch.from_numpy(positions | (values << 24)),
+        scales=export_csf_blocks(
+            fixed,
+            positions | (values << 24),
+            rows=rows,
+            columns=columns,
+            quantization="mxfp4" if group_size == 32 else "nvfp4",
+        ),
     )
     return source, torch.from_numpy(logical.copy())
 
@@ -60,18 +72,34 @@ def matrix(rows, channels, *, group_size, seed):
 def decode_planes(planes, rows, columns, group_size):
     """Reconstruct CPU scale bytes independently of B12X preparation."""
     result = []
-    for fixed, exceptions in zip(planes.fixed, planes.exceptions, strict=True):
-        selectors = (columns + 7) // 8 if group_size == 32 else columns // 2
-        slabs = fixed.numpy().reshape(rows // 16, 16 * (1 + selectors))
-        packed = slabs[:, 16:].reshape(rows, selectors)
-        if group_size == 32:
-            offsets = np.unpackbits(packed, axis=1, bitorder="little")[:, :columns]
-        else:
-            offsets = np.stack((packed & 15, packed >> 4), axis=-1).reshape(
-                rows, columns
-            )
-        logical = (slabs[:, :16].reshape(rows, 1) + offsets).astype(np.uint8)
-        words = exceptions.numpy()
-        logical.flat[words & 0xFFFFFF] = (words >> 24).astype(np.uint8)
-        result.append(torch.from_numpy(logical.copy()))
+    bits = 1 if group_size == 32 else 4
+    for plane in planes.planes:
+        logical = np.empty((rows, columns), dtype=np.uint8)
+        block = group = cursor = 0
+        for tr in range(0, rows, 128):
+            for tc in range(0, columns, 4):
+                for c in range(tc, min(tc + 4, columns), 2):
+                    for r in range(tr, min(tr + 128, rows), 32):
+                        width = min(2, columns - c)
+                        size = 32 * width * bits // 8
+                        fields = np.unpackbits(
+                            plane.codes[cursor : cursor + size], bitorder="little"
+                        ).reshape(-1, bits)
+                        offsets = (fields * (1 << np.arange(bits))).sum(axis=1)
+                        values = (
+                            plane.bases[r : r + 32, None] + offsets.reshape(32, width)
+                        ).astype(np.uint8)
+                        page = group // 32
+                        start, stop = map(
+                            int, plane.offsets[block + page : block + page + 2]
+                        )
+                        origin = int(plane.page_bases[page]) // 2
+                        for record in plane.exceptions[origin + start : origin + stop]:
+                            row, column = divmod(int(record) & 255, 2)
+                            values[row, column] = int(record) >> 8
+                        logical[r : r + 32, c : c + width] = values
+                        block += 1
+                        cursor += size
+                group += 1
+        result.append(torch.from_numpy(logical))
     return torch.stack(result)
