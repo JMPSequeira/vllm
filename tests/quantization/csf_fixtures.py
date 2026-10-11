@@ -71,6 +71,67 @@ def matrix(rows, channels, *, group_size, seed, finite_scales=False):
 
 def decode_planes(planes, rows, columns, group_size):
     """Reconstruct CPU scale bytes independently of B12X preparation."""
+    from types import SimpleNamespace
+
+    from b12x.loader._csf_blocks import CsfBlockPlane
+    from b12x.loader._csf_source import CsfSource
+
+    if isinstance(planes, CsfSource):
+        source = planes
+        result = []
+        starts = source.starts.cpu().tolist()
+        r0, r1 = source.row_range or (0, source.source_rows)
+        c0, c1 = source.column_range or (0, source.source_columns)
+        for index in range(source.segments):
+            components = [t[index].cpu().numpy() for t in source.components[:-1]]
+            exceptions = (
+                source.components[-1][starts[index] : starts[index + 1]].cpu().numpy()
+            )
+            if source.encoding == "csf":
+                fixed = components[0]
+                sr, sc = source.source_rows, source.source_columns
+                bits = 1 if group_size == 32 else 4
+                packed = fixed[:, 16:].reshape(sr, -1)
+                shifts = np.arange(sc) * bits
+                logical = fixed[:, :16].reshape(sr, 1) + (
+                    (packed[:, shifts // 8] >> (shifts % 8)) & ((1 << bits) - 1)
+                )
+                logical = logical.astype(np.uint8)
+                logical.flat[exceptions & 0xFFFFFF] = (exceptions >> 24).astype(
+                    np.uint8
+                )
+                logical = torch.from_numpy(logical)
+            else:
+                plane = CsfBlockPlane(
+                    source.source_rows,
+                    source.source_columns,
+                    source.quantization,
+                    *components,
+                    exceptions,
+                )
+                logical = decode_planes(
+                    SimpleNamespace(planes=(plane,)),
+                    plane.rows,
+                    plane.columns,
+                    group_size,
+                )[0]
+            selected = torch.full(
+                (source.rows // source.join, source.columns),
+                source.padding_base,
+                dtype=torch.uint8,
+            )
+            selected[: r1 - r0, : c1 - c0] = logical[r0:r1, c0:c1]
+            result.append(selected)
+        return torch.stack(
+            [
+                torch.cat(result[i : i + source.join])
+                for i in range(0, len(result), source.join)
+            ]
+        )
+    if isinstance(planes.planes[0], CsfSource):
+        return torch.cat(
+            [decode_planes(p, rows, columns, group_size) for p in planes.planes]
+        )
     result = []
     bits = 1 if group_size == 32 else 4
     for plane in planes.planes:

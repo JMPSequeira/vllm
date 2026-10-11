@@ -59,8 +59,9 @@ class Nvfp4CsfState:
 class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
     """Decode selected scale planes into model-owned native E4M3 scratch."""
 
-    def __init__(self, moe, owner, *, use_a16=False):
+    def __init__(self, moe, owner, *, use_a16=False, encoding="csf_32x2_v1"):
         super().__init__(moe)
+        self.encoding = encoding
         self.owner = owner
         self.use_a16 = use_a16 or bool(envs.VLLM_B12X_MOE_FP4_FORCE_A16)
         config = get_current_vllm_config_or_none()
@@ -127,19 +128,27 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                 param.csf_component = component
                 layer.register_parameter(f"{prefix}_{component}", param)
             scales = torch.nn.Module()
-            for component, dtype in (
-                ("bases", torch.uint8),
-                ("codes", torch.uint8),
-                ("page_bases", torch.uint32),
-                ("offsets", torch.uint16),
-                ("exceptions", torch.uint16),
-            ):
+            fields = (
+                (("fixed", torch.uint8), ("exceptions", torch.uint32))
+                if self.encoding == "csf"
+                else (
+                    ("bases", torch.uint8),
+                    ("codes", torch.uint8),
+                    ("page_bases", torch.uint32),
+                    ("offsets", torch.uint16),
+                    ("exceptions", torch.uint16),
+                )
+            )
+            for component, dtype in fields:
                 param = torch.nn.Parameter(
                     torch.empty(0, dtype=dtype), requires_grad=False
                 )
                 param.weight_loader = self.weight_loader
                 param.csf_component = component
-                scales.register_parameter(f"csf32_{component}", param)
+                scales.register_parameter(
+                    f"{'nvfp4_csf' if self.encoding == 'csf' else 'csf32'}_{component}",
+                    param,
+                )
             layer.add_module(f"{prefix}_weight_scale", scales)
 
     def weight_loader(
@@ -151,9 +160,7 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         expert_id=None,
         return_success=False,
     ):
-        from b12x.loader._csf_blocks import CsfBlockPlane
-
-        from .utils.nvfp4_csf_utils import _slice_scale_plane
+        from b12x.loader._csf_source import stage_csf_sources
 
         if (
             shard_id not in ("w1", "w2", "w3")
@@ -214,8 +221,8 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             values[field_name] = materialize_weight(loaded_weight).cpu()
         else:
             parts = self._scale_parts.setdefault(key, {})
-            parts[field_name] = materialize_weight(loaded_weight).cpu()
-            if len(parts) == 5:
+            parts[field_name] = materialize_weight(loaded_weight)
+            if len(parts) == (2 if self.encoding == "csf" else 5):
                 if shard_id == "w2":
                     rows, columns = h, width // 16
                     row_slice, column_slice = (0, h), (first // 16, last // 16)
@@ -224,18 +231,23 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                     rows, columns = width, h // 16
                     row_slice, column_slice = (first, last), (0, columns)
                     out_rows, out_columns = n, columns
-                plane = CsfBlockPlane(
-                    rows, columns, "nvfp4", **{k: v.numpy() for k, v in parts.items()}
+                fields = (
+                    ("fixed", "exceptions")
+                    if self.encoding == "csf"
+                    else ("bases", "codes", "page_bases", "offsets", "exceptions")
                 )
-                plane.validate()
-                values["scales"] = _slice_scale_plane(
-                    plane,
-                    rows,
-                    columns,
-                    row_slice,
-                    column_slice,
-                    out_rows,
-                    out_columns,
+                values["scales"] = stage_csf_sources(
+                    [tuple(parts[field] for field in fields)],
+                    rows=rows,
+                    columns=columns,
+                    quantization="nvfp4",
+                    encoding=self.encoding,
+                    device=param.device,
+                    row_range=row_slice,
+                    column_range=column_slice,
+                    padded_rows=out_rows,
+                    padded_columns=out_columns,
+                    padding_base=0x38,
                 )
                 del self._scale_parts[key]
         return True if return_success else None

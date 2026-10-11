@@ -412,7 +412,7 @@ def test_csf_contract_rejects_invalid_encoding_and_index(tmp_path, fault):
     config = json.loads((tmp_path / "config.json").read_text())
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
     if fault == "encoding":
-        config["quantization_config"]["weight_scale_encoding"] = "csf"
+        config["quantization_config"]["weight_scale_encoding"] = "unknown"
     elif fault == "family":
         config["model_type"] = "unrecognized"
     elif fault == "inventory":
@@ -537,8 +537,12 @@ def test_rejects_unaligned_rows_and_out_of_block_records():
     records = source.scales.exceptions.copy()
     records[0] |= 64
     invalid = replace(source.scales, exceptions=records)
+    if not torch.cuda.is_available():
+        pytest.skip("GPU payload validation requires CUDA")
+    from b12x._lib.quant._csf_prepare import validate_source
+
     with pytest.raises(ValueError, match="positions"):
-        slice_scale_plane(invalid, 64, 9, (0, 64), (0, 9))
+        validate_source(slice_scale_plane(invalid, 64, 9, (0, 64), (0, 9)).to("cuda"))
 
 
 @pytest.mark.parametrize("tp_size,rank", [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])

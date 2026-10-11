@@ -13,6 +13,7 @@ from safetensors import safe_open
 
 if TYPE_CHECKING:
     from b12x.loader._csf_blocks import CsfBlockPlane
+    from b12x.loader._csf_source import CsfSource
 
 CSF_ENCODING = "csf_32x2_v1"
 CSF_COMPONENTS = ("bases", "codes", "page_bases", "offsets", "exceptions")
@@ -38,7 +39,7 @@ class CsfMatrix:
     """
 
     weight: PackedTensorView
-    scales: "CsfBlockPlane"
+    scales: "CsfBlockPlane | CsfSource"
     global_scale: torch.Tensor | None = None
     input_scale: torch.Tensor | None = None
 
@@ -65,8 +66,10 @@ def read_csf_contract(root, *, families):
     config = json.loads((root / "config.json").read_text())
     text = config.get("text_config", config)
     quant = config.get("quantization_config") or text.get("quantization_config", {})
-    if quant.get("weight_scale_encoding") != CSF_ENCODING:
-        raise ValueError(f"CSF requires weight_scale_encoding={CSF_ENCODING!r}")
+    if quant.get("weight_scale_encoding") not in ("csf", CSF_ENCODING):
+        raise ValueError(
+            f"CSF requires weight_scale_encoding='csf' or {CSF_ENCODING!r}"
+        )
     model_type = text.get("model_type", config.get("model_type"))
     family = {
         "deepseek_v4_1": "deepseek_v41",
@@ -112,14 +115,32 @@ class CsfTensorReader(ExitStack):
         view = self._handle(weight).get_slice(weight)
         rows, packed_columns = view.get_shape()
         columns = packed_columns * 2 // (16 if self.codec == "nvfp4" else 32)
-        components = {
-            component: self._handle(f"{scale}.csf32_{component}")
-            .get_tensor(f"{scale}.csf32_{component}")
-            .numpy()
-            for component in CSF_COMPONENTS
-        }
-        plane = CsfBlockPlane(rows, columns, self.codec, **components)
-        plane.validate()
+        if f"{scale}.csf32_bases" in self.source_names:
+            components = {
+                component: self._handle(f"{scale}.csf32_{component}")
+                .get_tensor(f"{scale}.csf32_{component}")
+                .numpy()
+                for component in CSF_COMPONENTS
+            }
+            plane = CsfBlockPlane(rows, columns, self.codec, **components)
+        else:
+            from b12x.loader._csf_source import CsfSource
+
+            prefix = f"{scale}.{self.codec}_csf_"
+            fixed, exceptions = (
+                self._handle(prefix + name).get_tensor(prefix + name)
+                for name in ("fixed", "exceptions")
+            )
+            plane = CsfSource(
+                (fixed[None], exceptions),
+                torch.tensor([0, exceptions.numel()], dtype=torch.int64),
+                rows,
+                columns,
+                self.codec,
+                1,
+                "csf",
+            )
+            plane.validate()
         return CsfMatrix(
             weight=view,
             scales=plane,

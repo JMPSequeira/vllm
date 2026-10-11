@@ -137,13 +137,15 @@ requires pipeline parallel size 1, without expert/data parallelism or ubatching.
 Install matching vLLM and B12X CSF support. For NVFP4, the standard model
 loader delivers scale components through the model's normal weight-loading
 hooks. ModelOpt selects the CSF expert method from `weight_scale_encoding`;
-that method validates and slices TP-local tensors. B12X receives those weights
-and compressed CPU scale planes through `prepare_weights`, which uploads and
-rearranges them for the selected kernels.
+that method slices packed weights and stages compressed scale components without
+CPU decoding or regrouping. B12X validates and gathers TP-local scale fields on
+CUDA, scans exception counts, and constructs compact native-layout payloads.
 
-Both quantization types require `csf_32x2_v1`; slab-format components and
-manifest-based containers are not accepted. MXFP4's separate loader preserves
-the model's native dense, draft, and file-backed embedding tensors.
+Both `csf_32x2_v1` and the slab encoding `csf` are accepted. Slab checkpoints
+store 16-row base/code streams and 32-bit position/value exceptions under
+`nvfp4_csf_fixed` / `nvfp4_csf_exceptions` or their `mxfp4_csf_` equivalents.
+Both encodings produce the same compact runtime representation. MXFP4's
+separate loader preserves native dense, draft, and file-backed embedding tensors.
 
 Preparation permutes compressed fields and exception positions for the selected
 scale destination: F8_128x4, packed W4A16, or MXFP4 A8 N256/N64 tiles. Expansion

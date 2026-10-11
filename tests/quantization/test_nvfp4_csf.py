@@ -8,6 +8,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -93,20 +94,24 @@ def test_csf_config_preserves_recipes_and_avoids_expert_allocations():
     assert owner._resolve_weight_scale_encoding("model.layers.45.mlp.experts") is None
 
 
-def test_modelopt_rejects_slab_csf_checkpoints():
-    with pytest.raises(ValueError, match="Unsupported weight_scale_encoding"):
-        ModelOptMixedPrecisionConfig.from_config(
-            {
-                "quant_algo": "MIXED_PRECISION",
-                "quantized_layers": {
-                    "model.layers.0.mlp.experts": {
-                        "quant_algo": "NVFP4",
-                        "group_size": 16,
-                        "weight_scale_encoding": "csf",
-                    }
-                },
-            }
-        )
+@pytest.mark.parametrize("encoding", ["csf", "csf_32x2_v1"])
+def test_modelopt_accepts_csf_checkpoint_encodings(encoding):
+    owner = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.experts": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "weight_scale_encoding": encoding,
+                }
+            },
+        }
+    )
+    assert owner.csf_state is not None
+    assert (
+        owner._resolve_weight_scale_encoding("model.layers.0.mlp.experts") == encoding
+    )
 
 
 def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monkeypatch):
@@ -577,8 +582,9 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("encoding", ["csf", "csf_32x2_v1"])
 def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
-    tmp_path, rank, reverse, direct, monkeypatch
+    tmp_path, rank, reverse, direct, monkeypatch, encoding
 ):
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
     from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
@@ -624,7 +630,7 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
                 layer.layer_name: {
                     "quant_algo": "NVFP4",
                     "group_size": 16,
-                    "weight_scale_encoding": "csf_32x2_v1",
+                    "weight_scale_encoding": encoding,
                 }
             },
         }
@@ -651,23 +657,38 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
             )
             projections.append(source)
             prefix = f"{expert}.{proj_name}."
+            if encoding == "csf":
+                from b12x.loader._csf_blocks import logical_csf_components
+
+                bases, codes, positions, values = logical_csf_components(source.scales)
+                packed_codes = codes[:, ::2] | (codes[:, 1::2] << 4)
+                fixed = np.concatenate(
+                    (bases.reshape(-1, 16), packed_codes.reshape(8, -1)), axis=1
+                )
+                records = positions.astype(np.uint32) | (values.astype(np.uint32) << 24)
+                scale_parts: tuple[tuple[str, torch.Tensor], ...] = (
+                    ("nvfp4_csf_fixed", torch.from_numpy(fixed)),
+                    ("nvfp4_csf_exceptions", torch.from_numpy(records)),
+                )
+            else:
+                scale_parts = tuple(
+                    (f"csf32_{part}", torch.from_numpy(getattr(source.scales, part)))
+                    for part in (
+                        "bases",
+                        "codes",
+                        "page_bases",
+                        "offsets",
+                        "exceptions",
+                    )
+                )
             tensors.update(
                 {
                     prefix + suffix: tensor
                     for suffix, tensor in (
                         ("weight", source.weight.tensor),
                         *(
-                            (
-                                f"weight_scale.csf32_{part}",
-                                torch.from_numpy(getattr(source.scales, part)),
-                            )
-                            for part in (
-                                "bases",
-                                "codes",
-                                "page_bases",
-                                "offsets",
-                                "exceptions",
-                            )
+                            (f"weight_scale.{part}", tensor)
+                            for part, tensor in scale_parts
                         ),
                         ("weight_scale_2", source.global_scale),
                         ("input_scale", source.input_scale),

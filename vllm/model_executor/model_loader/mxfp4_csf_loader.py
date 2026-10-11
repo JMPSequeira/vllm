@@ -100,12 +100,14 @@ def read_mxfp4_csf_layer(
 
 
 def _slice_scale_plane(scales, rows, columns, row_slice, column_slice):
-    """Regroup a compressed TP rectangle without changing its scale bytes."""
-    from b12x.loader._csf_blocks import slice_csf_blocks
+    """Describe a TP rectangle; payload validation and regrouping run on CUDA."""
+    from b12x.loader._csf_source import upload_csf_planes
 
     if (scales.rows, scales.columns, scales.quantization) != (rows, columns, "mxfp4"):
-        raise ValueError("MXFP4-CSF block geometry differs from its packed weights")
-    return slice_csf_blocks(scales, row_range=row_slice, column_range=column_slice)
+        raise ValueError("MXFP4-CSF scale geometry differs from its packed weights")
+    return upload_csf_planes(
+        (scales,), "cpu", row_range=row_slice, column_range=column_slice
+    )
 
 
 def _load_mxfp4_csf_weights(
@@ -126,24 +128,25 @@ def _load_mxfp4_csf_weights(
     stores, manifests and model-specific tensor names belong to the caller.
     Expanded scale buffers remain caller-owned for serialized layer execution.
     """
-    from b12x.loader._csf_blocks import concatenate_csf_blocks
-    from b12x.moe.fused_moe import CsfBlockPlanes, Mxfp4CsfWeights
+    from b12x.loader._csf_blocks import CsfBlockPlane
+    from b12x.loader._csf_source import CsfSource, batch_csf_sources
+    from b12x.moe.fused_moe import Mxfp4CsfWeights
 
     if num_experts <= 0 or hidden_size <= 0 or hidden_size % 64:
         raise ValueError("MXFP4-CSF requires experts and 64-aligned hidden channels")
     first, last = tp_extent(intermediate_size, tp_rank, tp_size, 32)
     local = last - first
     w13 = torch.empty(
-        (num_experts, 2 * local, hidden_size // 2), dtype=torch.uint8, device="cpu"
+        (num_experts, 2 * local, hidden_size // 2), dtype=torch.uint8, device=device
     )
     w2 = torch.empty(
-        (num_experts, hidden_size, local // 2), dtype=torch.uint8, device="cpu"
+        (num_experts, hidden_size, local // 2), dtype=torch.uint8, device=device
     )
-    scales13, scales2 = [], []
+    scales13: list[CsfBlockPlane | CsfSource] = []
+    scales2: list[CsfBlockPlane | CsfSource] = []
     for expert, (first_projection, second_projection, down) in zip(
         range(num_experts), experts, strict=True
     ):
-        s13 = []
         for matrix, projection in enumerate(
             (first_projection, second_projection, down)
         ):
@@ -168,23 +171,40 @@ def _load_mxfp4_csf_weights(
                 w2[expert].copy_(view[:, first // 2 : last // 2].view(torch.uint8))
                 rows, columns = hidden_size, intermediate_size // 32
                 row_slice, column_slice = (0, rows), (first // 32, last // 32)
-            scales = _slice_scale_plane(
-                projection.scales,
+            scales = projection.scales
+            if (scales.rows, scales.columns, scales.quantization) != (
                 rows,
                 columns,
-                row_slice,
-                column_slice,
-            )
-            if matrix < 2:
-                s13.append(scales)
-            else:
-                scales2.append(scales)
-        scales13.append(concatenate_csf_blocks(s13))
+                "mxfp4",
+            ):
+                raise ValueError(
+                    "MXFP4-CSF scale geometry differs from its packed weights"
+                )
+            if isinstance(scales, CsfSource):
+                scales = scales.select(row_range=row_slice, column_range=column_slice)
+            (scales13 if matrix < 2 else scales2).append(scales)
     return Mxfp4CsfWeights(
-        w13=w13.to(device),
-        w2=w2.to(device),
-        w13_scales=CsfBlockPlanes(tuple(scales13)),
-        w2_scales=CsfBlockPlanes(tuple(scales2)),
+        w13=w13,
+        w2=w2,
+        w13_scales=batch_csf_sources(
+            scales13,
+            device,
+            join=2,
+            **(
+                {}
+                if isinstance(scales13[0], CsfSource)
+                else dict(row_range=(first, last))
+            ),
+        ),
+        w2_scales=batch_csf_sources(
+            scales2,
+            device,
+            **(
+                {}
+                if isinstance(scales2[0], CsfSource)
+                else dict(column_range=(first // 32, last // 32))
+            ),
+        ),
         w13_scale_scratch=w13_scale_scratch,
         w2_scale_scratch=w2_scale_scratch,
     )
