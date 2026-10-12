@@ -99,8 +99,11 @@ class KvarnMlaLayout:
         return (token_bytes + 7) // 8 * 8
 
     @property
-    def page_tail_bytes_per_token(self) -> float:
-        return self.k_col_scale_bytes / self.group
+    def page_tail_bytes_per_token(self) -> int | float:
+        # Integral when the tile scales divide evenly across the page (the
+        # launched g256 case: 3072/256 = 12); downstream int math requires it.
+        tail = self.k_col_scale_bytes / self.group
+        return int(tail) if tail == int(tail) else tail
 
     @property
     def page_size_bytes(self) -> int:
