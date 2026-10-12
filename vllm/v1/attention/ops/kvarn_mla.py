@@ -148,6 +148,20 @@ def hadamard_matrix(dim: int, device: torch.device) -> torch.Tensor:
     return h / math.sqrt(dim)
 
 
+def kvarn_cache_dtype_enabled(cache_dtype: object) -> bool:
+    """True when a cache config selects a kvarn MLA dtype."""
+    return isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_mla_")
+
+
+def rotate_latent(x: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
+    """Rotate the latent dimension of ``x`` with ``h_t = H^T`` (H orthonormal).
+
+    ``x``: ``[..., latent_dim]`` or ``[..., heads, latent_dim]``; the rotation
+    applies to the last dimension only, broadcasting over all leading dims.
+    """
+    return torch.matmul(x, h_t)
+
+
 def _imbalance(x: torch.Tensor) -> torch.Tensor:
     """Imb(X): max/min variance over columns plus over rows (Alg. 1, l.3-6)."""
     var_col = x.var(dim=1).clamp_min(1e-8)  # per-column variance [C]
@@ -315,7 +329,9 @@ def pack_kvarn_mla_tile(
     rec_f16[:, layout.k_row_scale_offset // 2] = k_row_scale
 
     # Page tail: tile-shared channel scales (duplicated nowhere).
-    tail = torch.zeros(layout.k_col_scale_bytes, dtype=torch.uint8, device=latent.device)
+    tail = torch.zeros(
+        layout.k_col_scale_bytes, dtype=torch.uint8, device=latent.device
+    )
     tail_f16 = tail.view(torch.float16)
     off = 0
     for vec in (col_scale, k_col_rt_scale, k_col_rt_zp.squeeze(-1)):
@@ -336,7 +352,7 @@ def unpack_kvarn_mla_tile(
 
     Reference (non-fused) inverse of :func:`pack_kvarn_mla_tile`.
     """
-    group = records.shape[0]
+    records.shape[0]
     latent_dim = layout.latent_dim
     rec_f16 = records.view(torch.float16)
 

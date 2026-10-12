@@ -11,6 +11,11 @@ from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.platforms import current_platform
+from vllm.v1.attention.ops.kvarn_mla import (
+    hadamard_matrix,
+    kvarn_cache_dtype_enabled,
+    rotate_latent,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.index_group import (
@@ -103,6 +108,16 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.is_sparse = mla_modules.is_sparse
         self.g_proj = mla_modules.g_proj
 
+        # KVarN MLA: cache records hold Hadamard-rotated latents. Rotate the
+        # query, the stored latent, and the attention output in this layer's
+        # forward (exact math: H is orthonormal; see
+        # vllm/v1/attention/ops/kvarn_mla.py). Weight-level folds are a later
+        # optimization; this works with any checkpoint quantization.
+        self._kvarn_rotate = kvarn_cache_dtype_enabled(
+            getattr(cache_config, "cache_dtype", None)
+        )
+        self._kvarn_h_t: torch.Tensor | None = None
+
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
         # the topk_tokens buffer written by a previous layer in the same pass.
@@ -161,6 +176,20 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.mla_attn.layer_name if enable_short_prefill_scoring_skip else ""
             )
         self.prefix = prefix
+
+    def _get_kvarn_h_t(self, like: torch.Tensor) -> torch.Tensor:
+        """Lazily materialize H^T on ``like``'s device/dtype (bf16 compute)."""
+        h_t = self._kvarn_h_t
+        if (
+            h_t is None
+            or h_t.device != like.device
+            or h_t.dtype != like.dtype
+        ):
+            latent_dim = self.kv_lora_rank
+            h = hadamard_matrix(latent_dim, like.device)
+            h_t = h.transpose(-2, -1).to(like.dtype)
+            self._kvarn_h_t = h_t
+        return h_t
 
     def forward(
         self,
@@ -231,6 +260,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             heads *= q_proj_layer.group_size
         q = q.view(-1, heads, self.qk_head_dim)
 
+        if self._kvarn_rotate:
+            # Rotate before the DCP query split so both the replicated and the
+            # local-shard query views carry the rotation.
+            q = rotate_latent(q, self._get_kvarn_h_t(q))
+
         if self.rotary_emb is not None:
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
@@ -248,6 +282,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.dcp_q_replicate:
             q_dcp_replicated, q = q, q_proj_layer._local_view(q)
 
+        if self._kvarn_rotate:
+            h_t = self._get_kvarn_h_t(kv_c_normed)
+            # The cache record stores H @ kv_c_normed; the dequant path
+            # recovers the original frame through the VarN rescale chain, so
+            # only this rotation is needed on the store side.
+            kv_c_normed = rotate_latent(kv_c_normed, h_t)
+
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
@@ -255,6 +296,20 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             q_dcp_replicated=q_dcp_replicated,
         )
+
+        if self._kvarn_rotate:
+            # Attention output accumulates rotated V latents; undo the
+            # rotation before o_proj (per-head, v_head_dim == latent_dim).
+            # Query/store use H @ x, so the output side needs H^T @ x.
+            attn_out = (
+                rotate_latent(
+                    attn_out.view(
+                        hidden_states.shape[0], self.num_heads, self.v_head_dim
+                    ),
+                    self._get_kvarn_h_t(kv_c_normed).transpose(-2, -1),
+                )
+                .reshape(attn_out.shape)
+            )
 
         if self.g_proj is not None:
             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()

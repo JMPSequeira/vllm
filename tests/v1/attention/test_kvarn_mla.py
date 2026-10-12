@@ -8,12 +8,14 @@ import torch
 from vllm.v1.attention.ops.kvarn_mla import (
     KvarnMlaLayout,
     hadamard_matrix,
+    kvarn_cache_dtype_enabled,
     kvarn_mla_layout_from_dtype,
     pack_bits,
+    pack_kvarn_mla_tile,
+    rotate_latent,
     unpack_bits,
     unpack_kvarn_mla_tile,
     varn_balance,
-    pack_kvarn_mla_tile,
 )
 from vllm.v1.kv_cache_interface import get_kv_quant_mode, parse_kvarn_mla_dtype
 
@@ -141,3 +143,28 @@ def test_pack_unpack_vs_fp16_reference_cosine():
 def test_hadamard_orthonormal():
     h = hadamard_matrix(512, torch.device("cpu"))
     torch.testing.assert_close(h @ h.T, torch.eye(512), rtol=1e-5, atol=1e-6)
+
+
+def test_rotation_invariance_math():
+    """H·q · H·k == q·k and H^T recovers the original frame (exact math)."""
+    gen = torch.Generator(device="cpu").manual_seed(4)
+    h = hadamard_matrix(512, torch.device("cpu"))
+    h_t = h.transpose(-2, -1)
+    q = torch.randn(8, 512, generator=gen)
+    k = torch.randn(8, 512, generator=gen)
+    v = torch.randn(8, 512, generator=gen)
+    qr = rotate_latent(q, h_t)  # H q
+    kr = rotate_latent(k, h_t)  # H k
+    torch.testing.assert_close(
+        (qr * kr).sum(-1), (q * k).sum(-1), rtol=1e-4, atol=1e-4
+    )
+    # output side: attention accumulates H v; H^T (H v) == v
+    out_rot = rotate_latent(v, h_t)
+    out = rotate_latent(out_rot, h_t.transpose(-2, -1))  # H^T (H v)
+    torch.testing.assert_close(out, v, rtol=1e-4, atol=1e-4)
+
+
+def test_kvarn_cache_dtype_enabled():
+    assert kvarn_cache_dtype_enabled("kvarn_mla_k4v2_g256")
+    assert not kvarn_cache_dtype_enabled("nvfp4_ds_mla")
+    assert not kvarn_cache_dtype_enabled(None)
