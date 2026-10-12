@@ -503,7 +503,9 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     return kv_cache_dtype
 
 
-_PACKED_SPARSE_MLA_CACHE_DTYPES = frozenset({"fp8_ds_mla", "nvfp4_ds_mla"})
+_PACKED_SPARSE_MLA_CACHE_DTYPES = frozenset(
+    {"fp8_ds_mla", "nvfp4_ds_mla"}
+)
 
 
 def _is_packed_sparse_mla_cache_dtype(kv_cache_dtype: CacheDType) -> bool:
@@ -515,7 +517,10 @@ def _is_packed_sparse_mla_cache_dtype(kv_cache_dtype: CacheDType) -> bool:
     Returns:
         Whether the dtype represents a packed sparse MLA record.
     """
-    return kv_cache_dtype in _PACKED_SPARSE_MLA_CACHE_DTYPES
+    return kv_cache_dtype in _PACKED_SPARSE_MLA_CACHE_DTYPES or (
+        isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype.startswith("kvarn_mla_")
+    )
 
 
 def _uses_packed_sparse_mla_workspace(kv_cache_spec: AttentionSpec) -> bool:

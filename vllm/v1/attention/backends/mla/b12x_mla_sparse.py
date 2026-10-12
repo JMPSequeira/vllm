@@ -510,6 +510,9 @@ class B12xMLASparseBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_ds_mla",
         "nvfp4_ds_mla",
+        "kvarn_mla_k4v4_g256",
+        "kvarn_mla_k5v5_g256",
+        "kvarn_mla_k4v2_g256",
     ]
 
     @staticmethod
