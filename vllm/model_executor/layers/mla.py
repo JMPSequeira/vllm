@@ -260,11 +260,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             heads *= q_proj_layer.group_size
         q = q.view(-1, heads, self.qk_head_dim)
 
-        if self._kvarn_rotate:
-            # Rotate before the DCP query split so both the replicated and the
-            # local-shard query views carry the rotation.
-            q = rotate_latent(q, self._get_kvarn_h_t(q))
-
         if self.rotary_emb is not None:
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe

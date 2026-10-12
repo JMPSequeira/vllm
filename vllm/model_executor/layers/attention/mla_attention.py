@@ -652,6 +652,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_cache_dtype: CacheDType = cache_config.cache_dtype
         else:
             kv_cache_dtype = "auto"
+        from vllm.v1.attention.ops.kvarn_mla import kvarn_cache_dtype_enabled
+
+        self._kvarn_rotate = kvarn_cache_dtype_enabled(kv_cache_dtype)
         self.quant_config = quant_config
 
         if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
@@ -1612,6 +1615,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if pre_w_uk_t is not None:
                 pre_w_uk_t.copy_(w_uk_t)
                 w_uk_t = pre_w_uk_t
+            if self._kvarn_rotate:
+                # KVarN: cache records hold H-rotated latents; the absorbed
+                # query must live in the rotated frame too. The absorbed
+                # projection q_c = q_nope @ W_UK_T is folded here (bf16
+                # dequantized copy, no requantization): q_c' = q_c @ H^T.
+                from vllm.v1.attention.ops.kvarn_mla import hadamard_matrix
+
+                h_t = hadamard_matrix(
+                    self.kv_lora_rank, w_uk_t.device
+                ).transpose(-2, -1).to(w_uk_t.dtype)
+                w_uk_t = torch.matmul(w_uk_t, h_t)
             replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
             if self.dcp_q_replicate:
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
