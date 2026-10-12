@@ -111,16 +111,18 @@ class KvarnMlaLayout:
 
     @property
     def page_tail_bytes_per_token(self) -> int:
-        """(C4-aligned semantic page + 8448B indexer tail - records) / 256."""
-        semantic = self.record_bytes * self.group
-        aligned = (semantic + 8447) // 8448 * 8448
-        return (aligned + 8448 - semantic) // self.group
+        """Per-token page tail: the 8448B C4 indexer tail plus the 3072B
+        KVarN tile-scale tail (which sits right after the records, before the
+        indexer's aligned tail), rounded up to a whole 8448B C4 page so the
+        parent-page stride stays an exact C4-page multiple (tail bytes must
+        be a multiple of 33 per token)."""
+        needed = 8448 + self.k_col_scale_bytes  # indexer + tile scales
+        per_token = (needed + self.group - 1) // self.group
+        return (per_token + 32) // 33 * 33
 
     @property
     def page_size_bytes(self) -> int:
-        semantic = self.record_bytes * self.group
-        aligned = (semantic + 8447) // 8448 * 8448
-        return aligned + 8448
+        return self.record_bytes * self.group + self.page_tail_bytes_per_token * self.group
 
     @property
     def k_code_offset(self) -> int:
