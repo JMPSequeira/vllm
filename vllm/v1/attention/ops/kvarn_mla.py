@@ -89,25 +89,38 @@ class KvarnMlaLayout:
 
     @property
     def record_bytes(self) -> int:
-        token_bytes = (
-            self.k_code_bytes
-            + self.v_code_bytes
-            + 2  # v_scale
-            + 2  # v_zp
-            + 2  # k_row_scale
-        )
-        return (token_bytes + 7) // 8 * 8
+        """Padded record width.
+
+        Beyond the 8-byte alignment, ``record_bytes % 33 <= 21`` keeps the
+        GLM C4-page alignment gap (records end -> 8448B indexer tail) at
+        >= 3072 bytes so the per-page tile-scale tail fits inside it and the
+        parent-page stride stays an exact multiple of the 8448-byte C4 page
+        (33 * 256 = 8448).
+        """
+        content = self.k_code_bytes + self.v_code_bytes + 6
+        r = (content + 7) // 8 * 8
+        # m == 0 puts the records end exactly on the C4 boundary (no gap);
+        # require 0 < m <= 21 so the gap fits the 3072B tile-scale tail.
+        while r % 33 == 0 or r % 33 > 21:
+            r += 8
+        return r
 
     @property
-    def page_tail_bytes_per_token(self) -> int | float:
-        # Integral when the tile scales divide evenly across the page (the
-        # launched g256 case: 3072/256 = 12); downstream int math requires it.
-        tail = self.k_col_scale_bytes / self.group
-        return int(tail) if tail == int(tail) else tail
+    def content_bytes(self) -> int:
+        return self.k_code_bytes + self.v_code_bytes + 6
+
+    @property
+    def page_tail_bytes_per_token(self) -> int:
+        """(C4-aligned semantic page + 8448B indexer tail - records) / 256."""
+        semantic = self.record_bytes * self.group
+        aligned = (semantic + 8447) // 8448 * 8448
+        return (aligned + 8448 - semantic) // self.group
 
     @property
     def page_size_bytes(self) -> int:
-        return self.record_bytes * self.group + self.k_col_scale_bytes
+        semantic = self.record_bytes * self.group
+        aligned = (semantic + 8447) // 8448 * 8448
+        return aligned + 8448
 
     @property
     def k_code_offset(self) -> int:
