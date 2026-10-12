@@ -1484,6 +1484,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 kvarn_group=layout.group,
                 cache_record_bytes=layout.record_bytes,
             )
+            if mode != "decode":
+                # KVarN extend runs on the decode kernel: the MG prefill
+                # kernel has no KVARN_DUAL arm (its bulk-record IO requires
+                # 16B-aligned records), and at 16 local q heads (= one head
+                # group) the decode kernel amortizes the same KV gather.
+                caps_kwargs["mode"] = "decode"
+                caps_kwargs["num_q_heads"] = self._kernel_num_heads
+                # 4096 rows saturate the SMs, so the split-K depth is tiny;
+                # the scratch is rows x chunks x heads x 512 x 2B and the
+                # uncapped chunk count (33) would over-provision it ~16x.
+                caps_kwargs["max_chunks_per_row"] = 2
         if self._uses_nvfp4_cache:
             caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         caps = self._module.Caps(**caps_kwargs)
