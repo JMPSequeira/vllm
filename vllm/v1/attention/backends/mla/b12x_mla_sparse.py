@@ -1903,6 +1903,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             # Fresh pool per cache binding; stale shadows never survive a
             # reconfiguration (the writer requires whole pages per call).
             self._kvarn_shadow = None
+            import os as _os
+
+            if _os.environ.get("B12X_KVARN_DEBUG"):
+                logger.info(
+                    "kvarn bind: kv_cache %s strides %s dtype %s; "
+                    "layout record %d page_tail %d page %d",
+                    tuple(kv_cache.shape),
+                    tuple(kv_cache.stride()),
+                    kv_cache.dtype,
+                    self._kvarn_layout.record_bytes,
+                    self._kvarn_layout.page_tail_bytes_per_token,
+                    self._kvarn_layout.page_size_bytes,
+                )
         if self._uses_glm_dsa_nvfp4_cache and (
             kv_cache.ndim != 3
             or int(kv_cache.shape[-1]) != _GLM_DSA_NVFP4_CACHE_RECORD_BYTES
