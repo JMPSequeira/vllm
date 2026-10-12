@@ -22,7 +22,6 @@ v_codes                 ceil(latent_dim * v_bits / 8)   (per-token)
 v_scale   (fp16)        2
 v_zp      (fp16)        2
 k_row_scale (fp16)      2   (VarN token scale, score path)
-rope      (bf16)        rope_dim * 2  (exact, post-RoPE)
 ======================  ==========================================
 
 Per-page tail (page == one VarN tile of ``group`` tokens, carried via
@@ -74,7 +73,6 @@ class KvarnMlaLayout:
     v_bits: int
     group: int
     latent_dim: int = 512
-    rope_dim: int = 64
 
     @property
     def k_code_bytes(self) -> int:
@@ -97,7 +95,6 @@ class KvarnMlaLayout:
             + 2  # v_scale
             + 2  # v_zp
             + 2  # k_row_scale
-            + self.rope_dim * 2  # exact bf16 rope
         )
         return (token_bytes + 7) // 8 * 8
 
@@ -129,9 +126,6 @@ class KvarnMlaLayout:
     def k_row_scale_offset(self) -> int:
         return self.v_zp_offset + 2
 
-    @property
-    def rope_offset(self) -> int:
-        return self.k_row_scale_offset + 2
 
 
 def kvarn_mla_layout_from_dtype(kv_cache_dtype: str) -> KvarnMlaLayout:
@@ -266,7 +260,6 @@ def _rtn_codes(
 @torch.no_grad()
 def pack_kvarn_mla_tile(
     latent: torch.Tensor,
-    rope: torch.Tensor,
     layout: KvarnMlaLayout,
     varn_iters: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -274,7 +267,6 @@ def pack_kvarn_mla_tile(
 
     Args:
         latent: ``[group, latent_dim]`` float tensor, already Hadamard-rotated.
-        rope: ``[group, rope_dim]`` float tensor, exact post-RoPE values.
         layout: record geometry.
 
     Returns:
@@ -321,11 +313,6 @@ def pack_kvarn_mla_tile(
     rec_f16[:, layout.v_scale_offset // 2] = v_scale.to(torch.float16)
     rec_f16[:, layout.v_zp_offset // 2] = v_zp.to(torch.float16)
     rec_f16[:, layout.k_row_scale_offset // 2] = k_row_scale
-    # Exact rope.
-    rope_f16 = rope.to(torch.bfloat16).view(torch.uint8)
-    records[:, layout.rope_offset : layout.rope_offset + layout.rope_dim * 2] = (
-        rope_f16
-    )
 
     # Page tail: tile-shared channel scales (duplicated nowhere).
     tail = torch.zeros(layout.k_col_scale_bytes, dtype=torch.uint8, device=latent.device)
@@ -345,7 +332,7 @@ def unpack_kvarn_mla_tile(
     page_tail: torch.Tensor,
     layout: KvarnMlaLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dequantize one tile back to ``(latent_hat [group, latent_dim] f32, rope)``.
+    """Dequantize one tile back to ``(k_hat, v_hat)`` [group, latent_dim] f32.
 
     Reference (non-fused) inverse of :func:`pack_kvarn_mla_tile`.
     """
@@ -383,9 +370,4 @@ def unpack_kvarn_mla_tile(
         col_scale.unsqueeze(0) * k_row_scale.unsqueeze(1)
     )
 
-    rope = (
-        records[:, layout.rope_offset : layout.rope_offset + layout.rope_dim * 2]
-        .view(torch.bfloat16)
-        .to(torch.float32)
-    )
-    return k_hat, v_hat, rope
+    return k_hat, v_hat

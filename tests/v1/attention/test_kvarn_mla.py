@@ -37,12 +37,12 @@ def test_layout_geometry():
     k4v4 = KvarnMlaLayout(k_bits=4, v_bits=4, group=256)
     k5v5 = KvarnMlaLayout(k_bits=5, v_bits=5, group=256)
     k4v2 = KvarnMlaLayout(k_bits=4, v_bits=2, group=256)
-    # 512*4/8=256 code + 256 code + 2+2+2 scales + 128 rope = 646 -> 648
-    assert k4v4.record_bytes == 648
-    # 320 + 320 + 6 + 128 = 774 -> 776
-    assert k5v5.record_bytes == 776
-    # 256 + 128 + 6 + 128 = 518 -> 520
-    assert k4v2.record_bytes == 520
+    # 512*4/8=256 code + 256 code + 2+2+2 scales = 518 -> 520
+    assert k4v4.record_bytes == 520
+    # 320 + 320 + 6 = 646 -> 648
+    assert k5v5.record_bytes == 648
+    # 256 + 128 + 6 = 390 -> 392
+    assert k4v2.record_bytes == 392
     for layout in (k4v4, k5v5, k4v2):
         # tail = 3 * 512 * 2 = 3072; page = records + tail
         assert layout.k_col_scale_bytes == 3072
@@ -54,10 +54,9 @@ def test_layout_geometry():
             layout.v_scale_offset,
             layout.v_zp_offset,
             layout.k_row_scale_offset,
-            layout.rope_offset,
         ]
         assert offs == sorted(offs)
-        assert layout.rope_offset + 128 <= layout.record_bytes
+        assert layout.k_row_scale_offset + 2 <= layout.record_bytes
 
 
 @pytest.mark.parametrize("bits", [2, 4, 5])
@@ -101,19 +100,14 @@ def test_pack_unpack_parity(dtype: str):
     layout = kvarn_mla_layout_from_dtype(dtype)
     gen = torch.Generator(device="cpu").manual_seed(2)
     latent = torch.randn(layout.group, layout.latent_dim, generator=gen)
-    rope = torch.randn(layout.group, layout.rope_dim, generator=gen)
 
-    records, page_tail = pack_kvarn_mla_tile(latent, rope, layout)
+    records, page_tail = pack_kvarn_mla_tile(latent, layout)
     assert records.shape == (layout.group, layout.record_bytes)
     assert page_tail.numel() == layout.k_col_scale_bytes
 
-    k_hat, v_hat, rope_hat = unpack_kvarn_mla_tile(records, page_tail, layout)
+    k_hat, v_hat = unpack_kvarn_mla_tile(records, page_tail, layout)
     assert k_hat.shape == latent.shape
     assert v_hat.shape == latent.shape
-    # Exact rope round-trip through bf16.
-    torch.testing.assert_close(
-        rope_hat, rope.to(torch.bfloat16).to(torch.float32), rtol=0, atol=0
-    )
     # Dequantized scores preserve cosine structure of the Hadamard-rotated
     # latent (what attention logits see): mean cosine similarity must be high.
     k_hat_n = k_hat / k_hat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -132,12 +126,11 @@ def test_pack_unpack_vs_fp16_reference_cosine():
     """k5v5 must beat k4v2 on score-path fidelity (monotone in bits)."""
     gen = torch.Generator(device="cpu").manual_seed(3)
     latent = torch.randn(256, 512, generator=gen)
-    rope = torch.randn(256, 64, generator=gen)
 
     def mean_cos(dtype):
         layout = kvarn_mla_layout_from_dtype(dtype)
-        recs, tail = pack_kvarn_mla_tile(latent, rope, layout)
-        k_hat, _, _ = unpack_kvarn_mla_tile(recs, tail, layout)
+        recs, tail = pack_kvarn_mla_tile(latent, layout)
+        k_hat, _ = unpack_kvarn_mla_tile(recs, tail, layout)
         n = k_hat / k_hat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         ref = latent / latent.norm(dim=-1, keepdim=True)
         return (n * ref).sum(-1).mean().item()
