@@ -1281,6 +1281,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self.topk_indices_buffer is None:
             raise ValueError("B12X sparse MLA requires a top-k index buffer.")
         uses_nvfp4_cache = kv_cache_dtype == "nvfp4_ds_mla"
+        self._uses_kvarn_cache = (
+            get_kv_quant_mode(kv_cache_dtype) == KVQuantMode.KVARN_MLA
+        )
+        self._kvarn_layout = None
+        if self._uses_kvarn_cache:
+            from vllm.v1.attention.ops.kvarn_mla import kvarn_mla_layout_from_dtype
+
+            self._kvarn_layout = kvarn_mla_layout_from_dtype(kv_cache_dtype)
         self._uses_glm_dsa_nvfp4_cache = self._is_glm_dsa and uses_nvfp4_cache
         if uses_nvfp4_cache and not (
             self._is_glm_next or self._uses_glm_dsa_nvfp4_cache
@@ -1289,11 +1297,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 "B12X nvfp4_ds_mla requires GLM5Next or the "
                 "GLM-5.2/5.3 DSA architecture."
             )
-        if kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
+        if not self._uses_kvarn_cache and kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+        ):
             raise ValueError(
-                "B12X sparse MLA requires a packed fp8_ds_mla or "
-                "nvfp4_ds_mla KV cache; "
-                f"got kv_cache_dtype={kv_cache_dtype!r}."
+                "B12X sparse MLA requires a packed fp8_ds_mla, nvfp4_ds_mla "
+                f"or kvarn_mla_* KV cache; got kv_cache_dtype={kv_cache_dtype!r}."
             )
         self._uses_nvfp4_cache = uses_nvfp4_cache
 
@@ -1303,7 +1313,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if not module.is_supported():
             raise RuntimeError("B12X sparse MLA is not supported on this device.")
         required_symbols = ["Caps", "bind", "plan", "run"]
-        if self._is_glm_next:
+        if self._uses_kvarn_cache:
+            required_symbols.append("concat_and_cache_glm_next_mla_kvarn")
+        elif self._is_glm_next:
             required_symbols.append(
                 "concat_and_cache_glm_next_mla_nvfp4"
                 if uses_nvfp4_cache
@@ -1318,7 +1330,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._model_type: int | None = None
         self._concat_and_cache_nvfp4_mla_fp8_rope = None
         self._concat_and_cache_glm_next_mla = None
-        if self._is_glm_next:
+        if self._uses_kvarn_cache:
+            self._model_type = int(module.ModelType.KVARN_MLA)
+            self._concat_and_cache_glm_next_mla_kvarn = (
+                module.concat_and_cache_glm_next_mla_kvarn
+            )
+        elif self._is_glm_next:
             self._model_type = int(module.ModelType.GLM_NEXT)
             self._concat_and_cache_glm_next_mla = (
                 module.concat_and_cache_glm_next_mla_nvfp4
@@ -1458,6 +1475,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         if self._model_type is not None:
             caps_kwargs["model_type"] = self._model_type
+        if self._uses_kvarn_cache:
+            layout = self._kvarn_layout
+            caps_kwargs.update(
+                scale_format=3,  # ScaleFormat.KVARN_DUAL
+                kvarn_k_bits=layout.k_bits,
+                kvarn_v_bits=layout.v_bits,
+                kvarn_group=layout.group,
+                cache_record_bytes=layout.record_bytes,
+            )
         if self._uses_nvfp4_cache:
             caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         caps = self._module.Caps(**caps_kwargs)
@@ -1873,6 +1899,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._kernel_page_size_finalized = True
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if self._uses_kvarn_cache:
+            # Fresh pool per cache binding; stale shadows never survive a
+            # reconfiguration (the writer requires whole pages per call).
+            self._kvarn_shadow = None
         if self._uses_glm_dsa_nvfp4_cache and (
             kv_cache.ndim != 3
             or int(kv_cache.shape[-1]) != _GLM_DSA_NVFP4_CACHE_RECORD_BYTES
@@ -1925,6 +1955,40 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
+        if self._uses_kvarn_cache:
+            if kv_cache.numel() == 0:
+                return
+            plan = self._cache_writer_plan
+            if plan is None:
+                raise PreparationResourceUnavailableError(
+                    f"{self._preparation_prefix()} has no declared cache_writer plan"
+                )
+            shadow = getattr(self, "_kvarn_shadow", None)
+            if shadow is None:
+                from vllm.v1.attention.ops.kvarn_page_shadow import (
+                    KvarnPageShadowPool,
+                )
+
+                shadow = KvarnPageShadowPool(
+                    self._kvarn_layout, kv_c_normed.device
+                )
+                self._kvarn_shadow = shadow
+            # kv_c_normed is already Hadamard-rotated (MLA wrapper). The
+            # shadow emits whole pages; incomplete pages are re-quantized
+            # whole on every touch and finalized on completion.
+            for page_base, page_latents, _n_valid in shadow.stage_update(
+                kv_c_normed, slot_mapping.flatten()
+            ):
+                page_slots = torch.arange(
+                    page_base,
+                    page_base + shadow.group,
+                    dtype=slot_mapping.dtype,
+                    device=kv_c_normed.device,
+                )
+                self._concat_and_cache_glm_next_mla_kvarn(
+                    page_latents, kv_cache, page_slots, plan=plan
+                )
+            return
         if self._uses_glm_dsa_nvfp4_cache:
             if kv_cache.numel() == 0:
                 return
