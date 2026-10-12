@@ -292,20 +292,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q_dcp_replicated=q_dcp_replicated,
         )
 
-        if self._kvarn_rotate:
-            # Attention output accumulates rotated V latents; undo the
-            # rotation before o_proj (per-head, v_head_dim == latent_dim).
-            # Query/store use H @ x, so the output side needs H^T @ x.
-            attn_out = (
-                rotate_latent(
-                    attn_out.view(
-                        hidden_states.shape[0], self.num_heads, self.v_head_dim
-                    ),
-                    self._get_kvarn_h_t(kv_c_normed).transpose(-2, -1),
-                )
-                .reshape(attn_out.shape)
-            )
-
         if self.g_proj is not None:
             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 

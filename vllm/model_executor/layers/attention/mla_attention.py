@@ -1606,6 +1606,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             # Convert from (L, N, V) to (N, L, V)
             w_uv = W_UV.transpose(0, 1)
+            if self._kvarn_rotate:
+                # KVarN: the kernel's V accumulator holds H-rotated latents
+                # (rows); the in-kernel W_UV projection must map them back:
+                # (H v) @ (H W_UV) == v @ W_UV.
+                from vllm.v1.attention.ops.kvarn_mla import hadamard_matrix
+
+                h = hadamard_matrix(self.kv_lora_rank, w_uv.device).to(w_uv.dtype)
+                w_uv = torch.matmul(h.expand(w_uv.shape[0], -1, -1), w_uv)
             if pre_w_uv is not None:
                 pre_w_uv.copy_(w_uv)
                 w_uv = pre_w_uv
