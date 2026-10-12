@@ -50,7 +50,12 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     refresh_dcp_local_seq_lens_,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVQuantMode,
+    MLAAttentionSpec,
+    get_kv_quant_mode,
+)
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -565,11 +570,18 @@ class B12xMLASparseBackend(AttentionBackend):
             if spec.cache_dtype_str == "nvfp4_ds_mla"
             else _GLM_NEXT_CACHE_RECORD_BYTES
         )
+        page_tail = _GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN
+        if get_kv_quant_mode(spec.cache_dtype_str) == KVQuantMode.KVARN_MLA:
+            from vllm.v1.attention.ops.kvarn_mla import kvarn_mla_layout_from_dtype
+
+            layout = kvarn_mla_layout_from_dtype(spec.cache_dtype_str)
+            record_bytes = layout.record_bytes
+            page_tail = layout.page_tail_bytes_per_token
         return replace(
             spec,
             state_content_bytes=record_bytes,
             alignment=_GLM_NEXT_INDEX_PAGE_BYTES,
-            page_tail_bytes_per_token=_GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN,
+            page_tail_bytes_per_token=page_tail,
             model_version="glm5_next",
         )
 
