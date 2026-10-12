@@ -168,3 +168,59 @@ def test_kvarn_cache_dtype_enabled():
     assert kvarn_cache_dtype_enabled("kvarn_mla_k4v2_g256")
     assert not kvarn_cache_dtype_enabled("nvfp4_ds_mla")
     assert not kvarn_cache_dtype_enabled(None)
+
+
+def test_page_shadow_whole_page_emission():
+    """Decode-style single-token stores produce whole-page re-emissions."""
+    from vllm.v1.attention.ops.kvarn_page_shadow import KvarnPageShadowPool
+
+    layout = kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256")
+    pool = KvarnPageShadowPool(layout, torch.device("cpu"))
+    gen = torch.Generator(device="cpu").manual_seed(5)
+
+    # Token 0 of page 0: one whole-page emission, still incomplete.
+    updates = pool.stage_update(torch.randn(1, 512, generator=gen),
+                                torch.tensor([0]))
+    assert len(updates) == 1
+    base, page, n = updates[0]
+    assert base == 0 and n == 1 and pool.shadow_size() == 1
+
+    # Decode steps 1..254: each re-emits page 0 whole with growing n.
+    for i in range(1, 255):
+        updates = pool.stage_update(torch.randn(1, 512, generator=gen),
+                                    torch.tensor([i]))
+        assert len(updates) == 1 and updates[0][0] == 0
+        assert updates[0][2] == i + 1
+    assert pool.shadow_size() == 1
+
+    # Token 255 completes the page: emitted once, shadow dropped.
+    updates = pool.stage_update(torch.randn(1, 512, generator=gen),
+                                torch.tensor([255]))
+    assert len(updates) == 1 and updates[0][2] == 256
+    assert pool.shadow_size() == 0
+
+    # A second page starts fresh at slot 256.
+    updates = pool.stage_update(torch.randn(2, 512, generator=gen),
+                                torch.tensor([256, 300]))
+    assert len(updates) == 1 and updates[0][0] == 256
+    assert updates[0][2] == 301 % 256  # offset 44 of page 1
+    assert pool.shadow_size() == 1
+
+    # reset_page clears a shadow.
+    pool.reset_page(256)
+    assert pool.shadow_size() == 0
+
+
+def test_page_shadow_multi_page_call():
+    from vllm.v1.attention.ops.kvarn_page_shadow import KvarnPageShadowPool
+
+    layout = kvarn_mla_layout_from_dtype("kvarn_mla_k4v2_g256")
+    pool = KvarnPageShadowPool(layout, torch.device("cpu"))
+    gen = torch.Generator(device="cpu").manual_seed(6)
+    # One call writing a full page plus the first token of the next.
+    latents = torch.randn(257, 512, generator=gen)
+    slots = torch.arange(257)
+    updates = pool.stage_update(latents, slots)
+    assert [u[0] for u in updates] == [0, 256]
+    assert updates[0][2] == 256 and updates[1][2] == 1
+    assert pool.shadow_size() == 1  # only the partial second page
