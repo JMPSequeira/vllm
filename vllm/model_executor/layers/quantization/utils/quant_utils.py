@@ -564,6 +564,27 @@ def get_and_maybe_dequant_weights(
             dequant_weights = dequant_weights.T
         return dequant_weights
 
+    # Block-FP8 weights (e.g. ModelOpt FP8_PB_WO) keep FP8 values and FP32
+    # [out/128, in/128] scales; kernels may pad the rows to a whole block.
+    # Dequantize them directly: weight preparation can run before the serving
+    # GEMM plans exist, so the identity-matrix fallback below cannot use them.
+    block = getattr(layer, "weight_block_size", None)
+    if block is not None and weight.dtype == torch.float8_e4m3fn:
+        block_scale = getattr(layer, "weight_scale_inv", None)
+        if block_scale is None:
+            block_scale = getattr(layer, "weight_scale", None)
+        if (
+            block_scale is not None
+            and block_scale.dim() == 2
+            and block_scale.dtype == torch.float32
+        ):
+            rows = getattr(layer, "output_size_per_partition", weight.shape[0])
+            cols = getattr(layer, "input_size_per_partition", weight.shape[1])
+            block_rows, block_cols = block
+            scale = block_scale.repeat_interleave(block_rows, 0)[: weight.shape[0]]
+            scale = scale.repeat_interleave(block_cols, 1)[:, : weight.shape[1]]
+            return (weight.to(torch.float32) * scale)[:rows, :cols].to(out_dtype)
+
     # NOTE: Most generic base case
     # - Call the layer with identity matrix which returns unquantized weights.
     # - Must be used with extra care when dealing with static activation quantization:

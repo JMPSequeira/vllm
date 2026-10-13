@@ -15,6 +15,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
@@ -58,6 +59,8 @@ from ..mamba_utils import (
 )
 from ..ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from ..ops.gather_initial_states import gather_initial_states
+
+logger = init_logger(__name__)
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
@@ -341,6 +344,39 @@ def _make_fused_conv1d_weight_loader(
     return weight_loader
 
 
+def split_kda_input_projection(quant_config: object | None, prefix: str) -> bool:
+    """Whether Q/K/V and the beta / forget-gate-factor rows need separate GEMMs.
+
+    A ModelOpt mixed checkpoint can store Q/K/V in one format (block FP8 or
+    MXFP8) and ``b_proj`` / ``f_a_proj`` in another (BF16, unlisted). One fused
+    GEMM holds one format, and the fused-layer lookup would otherwise apply the
+    Q/K/V format to the BF16 rows.
+    """
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    if not isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        return False
+    resolve = quant_config._resolve_quant_algo
+    qkv = {resolve(f"{prefix}.{name}") for name in ("q_proj", "k_proj", "v_proj")}
+    small = {resolve(f"{prefix}.{name}") for name in ("b_proj", "f_a_proj")}
+    if len(qkv) != 1 or len(small) != 1:
+        raise ValueError(
+            f"KDA projections at {prefix} need one format for q/k/v and one for "
+            f"b/f_a, got q/k/v {sorted(map(str, qkv))} and b/f_a "
+            f"{sorted(map(str, small))}."
+        )
+    if qkv == small:
+        return False
+    logger.info_once(
+        "KDA input projection runs as two GEMMs: q/k/v %s, b/f_a %s.",
+        next(iter(qkv)) or "BF16",
+        next(iter(small)) or "BF16",
+    )
+    return True
+
+
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with one output replicated across TP ranks.
 
@@ -514,17 +550,41 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_dim,
             ]
             self.in_proj_padding = 0
-        self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
-            self.hidden_size,
-            in_proj_output_sizes,
-            replicated_shard_id=4,
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvgfab",
+        # Mixed checkpoints keep Q/K/V and b/f_a in different formats; they then
+        # run as two GEMMs (q|k|v and b|f_a) instead of one fused projection.
+        self.split_input_projection = (
+            not self.use_full_rank_gate
+            and split_kda_input_projection(self.quant_config, prefix)
         )
-        if self.in_proj_padding:
-            self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+        if self.split_input_projection:
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                self.hidden_size,
+                [self.projection_size] * 3,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_bfa = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                [self.num_heads, self.head_dim],
+                replicated_shard_id=1,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_bfa",
+            )
+        else:
+            self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                replicated_shard_id=4,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
+            if self.in_proj_padding:
+                self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -652,7 +712,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.o_proj",
         )
         if self.tp_padded:
-            linears = [self.in_proj_qkvgfab, self.f_b_proj, self.o_proj]
+            linears = [*self.input_projections(), self.f_b_proj, self.o_proj]
             if not self.use_full_rank_gate:
                 linears.append(self.g_b_proj)
             for linear in linears:
@@ -702,12 +762,19 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_state_index_columns = state_index_columns
         # KDA consumes one forget-gate value per head dimension in either gate
         # mode. Keep beta's row stride equal to its fused-projection view.
-        self._b12x_kda_beta_row_width = self.in_proj_qkvgfab.output_size_per_partition
-        self._b12x_kda_beta_offset = (
-            4 * self.local_projection_size + self.head_dim
-            if self.use_full_rank_gate
-            else 3 * self.local_projection_size
-        )
+        if self.split_input_projection:
+            # Beta leads the separate b|f_a projection.
+            self._b12x_kda_beta_row_width = self.in_proj_bfa.output_size_per_partition
+            self._b12x_kda_beta_offset = 0
+        else:
+            self._b12x_kda_beta_row_width = (
+                self.in_proj_qkvgfab.output_size_per_partition
+            )
+            self._b12x_kda_beta_offset = (
+                4 * self.local_projection_size + self.head_dim
+                if self.use_full_rank_gate
+                else 3 * self.local_projection_size
+            )
         self.register_buffer(
             "_b12x_kda_query_start_loc",
             torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
@@ -745,7 +812,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         dtype, device = self.model_config.dtype, self._b12x_kda_num_tokens.device
         mixed_qkv = torch.empty((rows, 3 * heads * dim), dtype=dtype, device=device)
-        projection = getattr(self, "in_proj_qkvgfab", None)
+        projection = (
+            self.in_proj_bfa
+            if self.split_input_projection
+            else getattr(self, "in_proj_qkvgfab", None)
+        )
         packed = getattr(projection, "b12x_mxfp8_packed_weight", None)
         # Packing can append physical rows after capacity buffers initialize.
         beta_row_width = (
@@ -1523,36 +1594,61 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             return gate
         return torch.empty_like(gate)
 
-    def _forward_projections(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
-        projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
-        # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch of
-        # o_proj while the small projections and the recurrence run).
+    def input_projections(self) -> tuple[nn.Module, ...]:
+        """The GEMMs that produce q|k|v, beta and f_a from the layer input."""
+        if self.split_input_projection:
+            return (self.in_proj_qkv, self.in_proj_bfa)
+        return (self.in_proj_qkvgfab,)
+
+    def project_split_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the split q|k|v and b|f_a GEMMs; return (qkv, beta, f_a, owner)."""
+        mixed_qkv = self.in_proj_qkv(hidden_states)[0]
         _hook = getattr(self, "_l2_prefetch_hook", None)
         if _hook is not None:
             _hook(hidden_states.shape[0])
-        if self.use_full_rank_gate:
-            split_sizes = [
-                3 * self.local_projection_size,
-                self.local_projection_size,
-                self.head_dim,
-                self.local_num_heads,
-            ]
-            if self.in_proj_padding:
-                split_sizes.append(self.in_proj_padding)
-            projected = projected_qkvgfab.split(split_sizes, dim=-1)
-            mixed_qkv, g_proj_states, f_a, beta = projected[:4]
-        else:
-            mixed_qkv, beta, f_a = projected_qkvgfab.split(
-                [
-                    3 * self.local_projection_size,
-                    self.local_num_heads,
-                    self.head_dim,
-                ],
-                dim=-1,
+        projected_bfa = self.in_proj_bfa(hidden_states)[0]
+        beta, f_a = projected_bfa.split([self.local_num_heads, self.head_dim], dim=-1)
+        return mixed_qkv, beta, f_a, projected_bfa
+
+    def _forward_projections(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        projected = None
+        if self.split_input_projection:
+            mixed_qkv, beta, f_a, projected_qkvgfab = self.project_split_input(
+                hidden_states
             )
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        else:
+            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+            # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch
+            # of o_proj while the small projections and the recurrence run).
+            _hook = getattr(self, "_l2_prefetch_hook", None)
+            if _hook is not None:
+                _hook(hidden_states.shape[0])
+            if self.use_full_rank_gate:
+                split_sizes = [
+                    3 * self.local_projection_size,
+                    self.local_projection_size,
+                    self.head_dim,
+                    self.local_num_heads,
+                ]
+                if self.in_proj_padding:
+                    split_sizes.append(self.in_proj_padding)
+                projected = projected_qkvgfab.split(split_sizes, dim=-1)
+                mixed_qkv, g_proj_states, f_a, beta = projected[:4]
+            else:
+                mixed_qkv, beta, f_a = projected_qkvgfab.split(
+                    [
+                        3 * self.local_projection_size,
+                        self.local_num_heads,
+                        self.head_dim,
+                    ],
+                    dim=-1,
+                )
+                g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
 
         g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
@@ -1571,9 +1667,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         # Recurrence has consumed these views. Do not retain their backing
         # projections while the output GEMM and collective allocate results.
-        del mixed_qkv, g1, g2, beta, g_proj_states, f_a, projected_qkvgfab
-        if self.use_full_rank_gate:
-            del projected
+        del mixed_qkv, g1, g2, beta, g_proj_states, f_a, projected_qkvgfab, projected
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         return self.o_proj(core_attn_out)[0]
 
