@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the KVarN MLA record codec (layout, VarN, pack/unpack)."""
+"""Unit tests for the per-token KVarN MLA record codec (layout, pack/unpack)."""
 
 import pytest
 import torch
@@ -11,13 +11,12 @@ from vllm.v1.attention.ops.kvarn_mla import (
     kvarn_cache_dtype_enabled,
     kvarn_mla_layout_from_dtype,
     pack_bits,
-    pack_kvarn_mla_tile,
+    pack_kvarn_mla_records,
     rotate_latent,
     unpack_bits,
-    unpack_kvarn_mla_tile,
-    varn_balance,
+    unpack_kvarn_mla_records,
 )
-from vllm.v1.kv_cache_interface import get_kv_quant_mode, parse_kvarn_mla_dtype
+from vllm.v1.kv_cache_interface import parse_kvarn_mla_dtype
 
 DTYPES = [
     "kvarn_mla_k4v4_g256",
@@ -28,37 +27,33 @@ DTYPES = [
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_dtype_dispatch(dtype: str):
-    assert get_kv_quant_mode(dtype) == 11  # KVQuantMode.KVARN_MLA
-    k_bits, v_bits, group = parse_kvarn_mla_dtype(dtype)
     layout = kvarn_mla_layout_from_dtype(dtype)
-    assert (layout.k_bits, layout.v_bits, layout.group) == (k_bits, v_bits, group)
-    assert layout.record_bytes % 8 == 0
+    assert layout.record_bytes == KvarnMlaLayout(
+        k_bits=layout.k_bits, v_bits=layout.v_bits, group=layout.group
+    ).record_bytes
+    # Mod-33 rule: 0 < r % 33 <= 21 (reserved per-tile tail fits the C4 gap).
+    assert 0 < layout.record_bytes % 33 <= 21
+    # Offsets must be non-overlapping, ordered, inside the record.
+    offs = [
+        layout.k_code_offset,
+        layout.v_code_offset,
+        layout.k_scale_offset,
+        layout.k_zp_offset,
+        layout.v_scale_offset,
+        layout.v_zp_offset,
+    ]
+    assert offs == sorted(offs)
+    assert offs[0] == 0
+    assert offs[2] == layout.k_code_bytes + layout.v_code_bytes
+    assert layout.v_zp_offset + 2 <= layout.content_bytes
+    assert layout.content_bytes <= layout.record_bytes
 
 
-def test_layout_geometry():
-    k4v4 = KvarnMlaLayout(k_bits=4, v_bits=4, group=256)
-    k5v5 = KvarnMlaLayout(k_bits=5, v_bits=5, group=256)
-    k4v2 = KvarnMlaLayout(k_bits=4, v_bits=2, group=256)
-    # 512*4/8=256 code + 256 code + 2+2+2 scales = 518 -> 520
-    assert k4v4.record_bytes == 520
-    # 320 + 320 + 6 = 646 -> 648
-    assert k5v5.record_bytes == 648
-    # 256 + 128 + 6 = 390 -> 392
-    assert k4v2.record_bytes == 392
-    for layout in (k4v4, k5v5, k4v2):
-        # tail = 3 * 512 * 2 = 3072; page = records + tail
-        assert layout.k_col_scale_bytes == 3072
-        assert layout.page_size_bytes == layout.record_bytes * 256 + 3072
-        # offsets must be non-overlapping and inside the record
-        offs = [
-            layout.k_code_offset,
-            layout.v_code_offset,
-            layout.v_scale_offset,
-            layout.v_zp_offset,
-            layout.k_row_scale_offset,
-        ]
-        assert offs == sorted(offs)
-        assert layout.k_row_scale_offset + 2 <= layout.record_bytes
+def test_record_widths():
+    # Content (codes + 4 fp16) 8-byte aligned, then the mod-33 rule.
+    assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256").record_bytes == 536
+    assert kvarn_mla_layout_from_dtype("kvarn_mla_k5v5_g256").record_bytes == 648
+    assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v2_g256").record_bytes == 400
 
 
 @pytest.mark.parametrize("bits", [2, 4, 5])
@@ -73,41 +68,19 @@ def test_pack_bits_roundtrip(bits: int, cols: int):
     assert (unpack_bits(packed, bits, cols) == codes).all()
 
 
-def test_varn_balance_reduces_imbalance():
-    gen = torch.Generator(device="cpu").manual_seed(1)
-    # Deliberately imbalanced: channel 0 huge, token 3 huge.
-    tile = torch.randn(2, 64, 128, generator=gen)
-    tile[:, :, 0] *= 50.0
-    tile[:, 3, :] *= 30.0
-
-    def imb(x):
-        col = x.var(dim=1).clamp_min(1e-8)
-        row = x.var(dim=2).clamp_min(1e-8)
-        return (col.amax(1) / col.amin(1) + row.amax(1) / row.amin(1)).sum()
-
-    assert imb(tile) > 100.0
-    col_scale, row_scale, balanced = varn_balance(tile, iterations=8)
-    assert col_scale.shape == (2, 1, 128)
-    assert row_scale.shape == (2, 64, 1)
-    assert imb(balanced) < imb(tile) / 10.0
-    # exact rescale identity
-    torch.testing.assert_close(
-        balanced * col_scale * row_scale, tile, rtol=1e-4, atol=1e-4
-    )
-
-
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_pack_unpack_parity(dtype: str):
-    """Relative-error bound: 4-bit RTN on a balanced tile, loose sanity gate."""
+    """Per-token RTN parity: score-path cosine high, value-path bounded."""
     layout = kvarn_mla_layout_from_dtype(dtype)
     gen = torch.Generator(device="cpu").manual_seed(2)
     latent = torch.randn(layout.group, layout.latent_dim, generator=gen)
 
-    records, page_tail = pack_kvarn_mla_tile(latent, layout)
+    records = pack_kvarn_mla_records(latent, layout)
     assert records.shape == (layout.group, layout.record_bytes)
-    assert page_tail.numel() == layout.k_col_scale_bytes
+    # Pad region is zero.
+    assert int(records[:, layout.content_bytes:].sum()) == 0
 
-    k_hat, v_hat = unpack_kvarn_mla_tile(records, page_tail, layout)
+    k_hat, v_hat = unpack_kvarn_mla_records(records, layout)
     assert k_hat.shape == latent.shape
     assert v_hat.shape == latent.shape
     # Dequantized scores preserve cosine structure of the Hadamard-rotated
@@ -131,13 +104,24 @@ def test_pack_unpack_vs_fp16_reference_cosine():
 
     def mean_cos(dtype):
         layout = kvarn_mla_layout_from_dtype(dtype)
-        recs, tail = pack_kvarn_mla_tile(latent, layout)
-        k_hat, _ = unpack_kvarn_mla_tile(recs, tail, layout)
+        recs = pack_kvarn_mla_records(latent, layout)
+        k_hat, _ = unpack_kvarn_mla_records(recs, layout)
         n = k_hat / k_hat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         ref = latent / latent.norm(dim=-1, keepdim=True)
         return (n * ref).sum(-1).mean().item()
 
     assert mean_cos("kvarn_mla_k5v5_g256") >= mean_cos("kvarn_mla_k4v2_g256")
+
+
+def test_per_token_independence():
+    """Records quantize per token: appending tokens never changes others."""
+    gen = torch.Generator(device="cpu").manual_seed(7)
+    layout = kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256")
+    base = torch.randn(64, 512, generator=gen)
+    extra = torch.randn(8, 512, generator=gen)
+    r1 = pack_kvarn_mla_records(base, layout)
+    r2 = pack_kvarn_mla_records(torch.cat([base, extra]), layout)
+    assert torch.equal(r1, r2[:64])
 
 
 def test_hadamard_orthonormal():
@@ -168,59 +152,3 @@ def test_kvarn_cache_dtype_enabled():
     assert kvarn_cache_dtype_enabled("kvarn_mla_k4v2_g256")
     assert not kvarn_cache_dtype_enabled("nvfp4_ds_mla")
     assert not kvarn_cache_dtype_enabled(None)
-
-
-def test_page_shadow_whole_page_emission():
-    """Decode-style single-token stores produce whole-page re-emissions."""
-    from vllm.v1.attention.ops.kvarn_page_shadow import KvarnPageShadowPool
-
-    layout = kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256")
-    pool = KvarnPageShadowPool(layout, torch.device("cpu"))
-    gen = torch.Generator(device="cpu").manual_seed(5)
-
-    # Token 0 of page 0: one whole-page emission, still incomplete.
-    updates = pool.stage_update(torch.randn(1, 512, generator=gen),
-                                torch.tensor([0]))
-    assert len(updates) == 1
-    base, page, n = updates[0]
-    assert base == 0 and n == 1 and pool.shadow_size() == 1
-
-    # Decode steps 1..254: each re-emits page 0 whole with growing n.
-    for i in range(1, 255):
-        updates = pool.stage_update(torch.randn(1, 512, generator=gen),
-                                    torch.tensor([i]))
-        assert len(updates) == 1 and updates[0][0] == 0
-        assert updates[0][2] == i + 1
-    assert pool.shadow_size() == 1
-
-    # Token 255 completes the page: emitted once, shadow dropped.
-    updates = pool.stage_update(torch.randn(1, 512, generator=gen),
-                                torch.tensor([255]))
-    assert len(updates) == 1 and updates[0][2] == 256
-    assert pool.shadow_size() == 0
-
-    # A second page starts fresh at slot 256.
-    updates = pool.stage_update(torch.randn(2, 512, generator=gen),
-                                torch.tensor([256, 300]))
-    assert len(updates) == 1 and updates[0][0] == 256
-    assert updates[0][2] == 301 % 256  # offset 44 of page 1
-    assert pool.shadow_size() == 1
-
-    # reset_page clears a shadow.
-    pool.reset_page(256)
-    assert pool.shadow_size() == 0
-
-
-def test_page_shadow_multi_page_call():
-    from vllm.v1.attention.ops.kvarn_page_shadow import KvarnPageShadowPool
-
-    layout = kvarn_mla_layout_from_dtype("kvarn_mla_k4v2_g256")
-    pool = KvarnPageShadowPool(layout, torch.device("cpu"))
-    gen = torch.Generator(device="cpu").manual_seed(6)
-    # One call writing a full page plus the first token of the next.
-    latents = torch.randn(257, 512, generator=gen)
-    slots = torch.arange(257)
-    updates = pool.stage_update(latents, slots)
-    assert [u[0] for u in updates] == [0, 256]
-    assert updates[0][2] == 256 and updates[1][2] == 1
-    assert pool.shadow_size() == 1  # only the partial second page

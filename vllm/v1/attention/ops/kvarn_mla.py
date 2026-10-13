@@ -2,46 +2,43 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KVarN MLA (arXiv:2606.03458) packed-record layout and reference codec.
 
-KVarN = Hadamard rotation + dual-axis variance normalization (VarN) +
-round-to-nearest quantization of the glm5_next MLA compressed latent. The
-latent serves both the score (K) and value-aggregation (V) attention roles
-from one cache record, so each record carries TWO code planes at independent
-bit widths (``k_bits`` score path, ``v_bits`` value path).
+KVarN = Hadamard rotation + round-to-nearest quantization of the glm5_next
+MLA compressed latent, with per-token asymmetric RTN on both planes (the
+ninfer record scheme). The latent serves both the score (K) and
+value-aggregation (V) attention roles from one cache record, so each record
+carries TWO code planes at independent bit widths (``k_bits`` score path,
+``v_bits`` value path), each with its own inline fp16 scale + zero-point.
 
 Dtype grammar: ``kvarn_mla_k<k>[v<v>]_g<group>`` where ``group`` equals the
-vLLM cache block size (one VarN tile == one page). Launched variants:
+vLLM cache block size (one tile == one page). Launched variants:
 ``kvarn_mla_k4v4_g256``, ``kvarn_mla_k5v5_g256``, ``kvarn_mla_k4v2_g256``.
 
-Record layout (per token, latent_dim=512, rope_dim=64), little-endian:
+Record layout (per token, latent_dim=512), little-endian:
 
 ======================  ==========================================
 field                   size
 ======================  ==========================================
-k_codes                 ceil(latent_dim * k_bits / 8)   (per-channel)
+k_codes                 ceil(latent_dim * k_bits / 8)   (per-token)
 v_codes                 ceil(latent_dim * v_bits / 8)   (per-token)
+k_scale   (fp16)        2
+k_zp      (fp16)        2
 v_scale   (fp16)        2
 v_zp      (fp16)        2
-k_row_scale (fp16)      2   (VarN token scale, score path)
 ======================  ==========================================
 
-Per-page tail (page == one VarN tile of ``group`` tokens, carried via
-``page_tail_bytes_per_token`` = tail_bytes / group):
+Record width: 8-byte aligned content, padded by the mod-33 rule
+(``0 < r % 33 <= 21``) so the GLM C4-page alignment gap (records end ->
+8448B indexer tail) fits the reserved per-tile tail region and the
+parent-page stride stays an exact multiple of the 8448-byte C4 page
+(33 * 256 = 8448). The per-tile tail region (6400B for group=256) remains
+reserved in the page geometry but carries no scales: the per-token record
+scheme keeps every scale inline, so the tail is slack.
 
-======================  ==========================================
-k_col_scale (fp16)      latent_dim * 2   (VarN channel scale, score path)
-k_col_rt_scale (fp16)   latent_dim * 2   (per-channel RTN scale)
-k_col_rt_zp    (fp16)   latent_dim * 2   (per-channel RTN zero-point)
-======================  ==========================================
+Dequantization identities (rotated frame; the Hadamard inverse lives in
+the folded W_uv / absorbed Q projections):
 
-Dequantization identities:
-
-    k_hat[r, c] = (k_codes[r, c] - k_col_rt_zp[c]) * k_col_rt_scale[c]
-                  * k_col_scale[c] * k_row_scale[r]
-    v_hat[r, c] = (v_codes[r, c] * v_scale[r] + v_zp[r])
-
-The Hadamard rotation is applied by the caller at store time and absorbed
-into the q/v projections at load, so records hold rotated latents and no
-inverse transform is needed at read time.
+    k_hat[r, c] = k_codes[r, c] * k_scale[r] + k_zp[r]
+    v_hat[r, c] = v_codes[r, c] * v_scale[r] + v_zp[r]
 """
 
 from __future__ import annotations
@@ -53,11 +50,16 @@ import torch
 
 from vllm.v1.kv_cache_interface import parse_kvarn_mla_dtype
 
+# Reserved per-tile tail region (mirrors b12x _kvarn_writer._TILE_TAIL_BYTES):
+# sized so tile_stride = group*record_bytes + 6400 is an exact multiple of
+# the 8448B C4 page (256*536 + 6400 = 143616 = 17 * 8448). Carries no data
+# under the per-token record scheme; kept for C4 page alignment.
+_KVARN_TILE_TAIL_BYTES = 6400
+
 __all__ = [
     "KvarnMlaLayout",
     "kvarn_mla_layout_from_dtype",
     "hadamard_matrix",
-    "varn_balance",
     "pack_kvarn_mla_tile",
     "unpack_kvarn_mla_tile",
     "pack_bits",
@@ -83,9 +85,8 @@ class KvarnMlaLayout:
         return math.ceil(self.latent_dim * self.v_bits / 8)
 
     @property
-    def k_col_scale_bytes(self) -> int:
-        # VarN channel scale + RTN scale + RTN zero-point, fp16 each.
-        return self.latent_dim * 2 * 3
+    def content_bytes(self) -> int:
+        return self.k_code_bytes + self.v_code_bytes + 8
 
     @property
     def record_bytes(self) -> int:
@@ -93,30 +94,27 @@ class KvarnMlaLayout:
 
         Beyond the 8-byte alignment, ``record_bytes % 33 <= 21`` keeps the
         GLM C4-page alignment gap (records end -> 8448B indexer tail) at
-        >= 3072 bytes so the per-page tile-scale tail fits inside it and the
-        parent-page stride stays an exact multiple of the 8448-byte C4 page
-        (33 * 256 = 8448).
+        >= 3072 bytes so the reserved per-tile tail region fits inside it
+        and the parent-page stride stays an exact multiple of the 8448-byte
+        C4 page (33 * 256 = 8448). The tail carries no scales under the
+        per-token record scheme but stays reserved for C4 alignment.
         """
-        content = self.k_code_bytes + self.v_code_bytes + 6
+        content = self.k_code_bytes + self.v_code_bytes + 8
         r = (content + 7) // 8 * 8
         # m == 0 puts the records end exactly on the C4 boundary (no gap);
-        # require 0 < m <= 21 so the gap fits the 3072B tile-scale tail.
+        # require 0 < m <= 21 so the gap fits the reserved tile tail.
         while r % 33 == 0 or r % 33 > 21:
             r += 8
         return r
 
     @property
-    def content_bytes(self) -> int:
-        return self.k_code_bytes + self.v_code_bytes + 6
-
-    @property
     def page_tail_bytes_per_token(self) -> int:
-        """Per-token page tail: the 8448B C4 indexer tail plus the 3072B
-        KVarN tile-scale tail (which sits right after the records, before the
+        """Per-token page tail: the 8448B C4 indexer tail plus the reserved
+        per-tile tail region (which sits right after the records, before the
         indexer's aligned tail), rounded up to a whole 8448B C4 page so the
         parent-page stride stays an exact C4-page multiple (tail bytes must
         be a multiple of 33 per token)."""
-        needed = 8448 + self.k_col_scale_bytes  # indexer + tile scales
+        needed = 8448 + _KVARN_TILE_TAIL_BYTES  # indexer + reserved tail
         per_token = (needed + self.group - 1) // self.group
         return (per_token + 32) // 33 * 33
 
@@ -133,16 +131,20 @@ class KvarnMlaLayout:
         return self.k_code_bytes
 
     @property
-    def v_scale_offset(self) -> int:
+    def k_scale_offset(self) -> int:
         return self.v_code_offset + self.v_code_bytes
+
+    @property
+    def k_zp_offset(self) -> int:
+        return self.k_scale_offset + 2
+
+    @property
+    def v_scale_offset(self) -> int:
+        return self.k_zp_offset + 2
 
     @property
     def v_zp_offset(self) -> int:
         return self.v_scale_offset + 2
-
-    @property
-    def k_row_scale_offset(self) -> int:
-        return self.v_zp_offset + 2
 
 
 
@@ -152,6 +154,32 @@ def kvarn_mla_layout_from_dtype(kv_cache_dtype: str) -> KvarnMlaLayout:
         raise ValueError(f"Not a kvarn MLA dtype: {kv_cache_dtype!r}")
     k_bits, v_bits, group = parsed
     return KvarnMlaLayout(k_bits=k_bits, v_bits=v_bits, group=group)
+
+
+@torch.no_grad()
+def hadamard_matrix(dim: int, device: torch.device) -> torch.Tensor:
+    """Orthonormal Sylvester Hadamard matrix (dim must be a power of two)."""
+    h = torch.ones(1, 1, device=device, dtype=torch.float32)
+    while h.shape[0] < dim:
+        h = torch.cat(
+            [torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0
+        )
+    assert h.shape[0] == dim
+    return h / math.sqrt(dim)
+
+
+def kvarn_cache_dtype_enabled(cache_dtype: object) -> bool:
+    """True when a cache config selects a kvarn MLA dtype."""
+    return isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_mla_")
+
+
+def rotate_latent(x: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
+    """Rotate the latent dimension of ``x`` with ``h_t = H^T`` (H orthonormal).
+
+    ``x``: ``[..., latent_dim]`` or ``[..., heads, latent_dim]``; the rotation
+    applies to the last dimension only, broadcasting over all leading dims.
+    """
+    return torch.matmul(x, h_t)
 
 
 @torch.no_grad()
@@ -290,87 +318,56 @@ def _rtn_codes(
 
 
 @torch.no_grad()
-def pack_kvarn_mla_tile(
+def pack_kvarn_mla_records(
     latent: torch.Tensor,
     layout: KvarnMlaLayout,
-    varn_iters: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack one tile (group tokens) of rotated latents into records.
+) -> torch.Tensor:
+    """Pack rotated latents into per-token KVarN records.
 
     Args:
-        latent: ``[group, latent_dim]`` float tensor, already Hadamard-rotated.
+        latent: ``[T, latent_dim]`` float tensor, already Hadamard-rotated.
         layout: record geometry.
 
     Returns:
-        ``(records [group, record_bytes] uint8, page_tail [tail_bytes] uint8)``
+        ``records [T, record_bytes]`` uint8. Each record carries both code
+        planes and their inline fp16 scale/zero-point (asymmetric RTN
+        per token, ninfer scheme — no tile-coupled scales, no VarN).
     """
-    group, latent_dim = latent.shape
-    assert group == layout.group and latent_dim == layout.latent_dim
+    tokens, latent_dim = latent.shape
+    assert latent_dim == layout.latent_dim
     x = latent.to(torch.float32)
-    # VarN: normalize column (channel) and row (token) variance jointly.
-    col_scale, row_scale, balanced = varn_balance(
-        x.unsqueeze(0), iterations=varn_iters
-    )
-    col_scale = col_scale.squeeze(0)  # [C]
-    row_scale = row_scale.squeeze(0).squeeze(-1)  # [R]
-
-    # Score path: per-channel asymmetric RTN on the balanced tile
-    # (reduce over tokens = dim 1 of the [1, R, C] batch).
-    k_codes, k_col_rt_scale, k_col_rt_zp = _rtn_codes(
-        balanced, layout.k_bits, dim=1
-    )
-    # k_hat = (k_codes * k_col_rt_scale + k_col_rt_zp) * col_scale * row_scale
-    k_codes = k_codes.squeeze(0).contiguous()  # [R, C] token-major codes
-    k_row_scale = row_scale.to(torch.float16)
-
-    # Value path: per-token asymmetric RTN (reduce over channels = dim 2).
-    v_codes, v_scale, v_zp = _rtn_codes(balanced, layout.v_bits, dim=2)
-    v_codes = v_codes.squeeze(0)
-    v_scale = v_scale.reshape(-1)
-    v_zp = v_zp.reshape(-1)
-    # v_hat = v_codes * v_scale + v_zp  (balanced frame)
+    # Score path: per-token asymmetric RTN on the rotated latent.
+    k_codes, k_scale, k_zp = _rtn_codes(x, layout.k_bits, dim=1)
+    # Value path: per-token asymmetric RTN at the v_bits width.
+    v_codes, v_scale, v_zp = _rtn_codes(x, layout.v_bits, dim=1)
+    # k_hat = k_codes * k_scale + k_zp ; v_hat = v_codes * v_scale + v_zp
 
     records = torch.zeros(
-        group, layout.record_bytes, dtype=torch.uint8, device=latent.device
+        tokens, layout.record_bytes, dtype=torch.uint8, device=latent.device
     )
     rec_f16 = records.view(torch.float16)
-    # K codes: [R, C] -> bit stream of k_code_bytes per token.
     records[:, layout.k_code_offset : layout.k_code_offset + layout.k_code_bytes] = (
         pack_bits(k_codes, layout.k_bits).to(torch.uint8)
     )
-    # V codes.
     records[:, layout.v_code_offset : layout.v_code_offset + layout.v_code_bytes] = (
         pack_bits(v_codes, layout.v_bits).to(torch.uint8)
     )
+    rec_f16[:, layout.k_scale_offset // 2] = k_scale.to(torch.float16)
+    rec_f16[:, layout.k_zp_offset // 2] = k_zp.to(torch.float16)
     rec_f16[:, layout.v_scale_offset // 2] = v_scale.to(torch.float16)
     rec_f16[:, layout.v_zp_offset // 2] = v_zp.to(torch.float16)
-    rec_f16[:, layout.k_row_scale_offset // 2] = k_row_scale
-
-    # Page tail: tile-shared channel scales (duplicated nowhere).
-    tail = torch.zeros(
-        layout.k_col_scale_bytes, dtype=torch.uint8, device=latent.device
-    )
-    tail_f16 = tail.view(torch.float16)
-    off = 0
-    for vec in (col_scale, k_col_rt_scale, k_col_rt_zp.squeeze(-1)):
-        vec = vec.reshape(-1).to(torch.float16)
-        tail_f16[off : off + latent_dim] = vec
-        off += latent_dim
-    assert off * 2 == layout.k_col_scale_bytes
-    return records, tail
+    return records
 
 
 @torch.no_grad()
-def unpack_kvarn_mla_tile(
+def unpack_kvarn_mla_records(
     records: torch.Tensor,
-    page_tail: torch.Tensor,
     layout: KvarnMlaLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dequantize one tile back to ``(k_hat, v_hat)`` [group, latent_dim] f32.
+    """Dequantize records back to ``(k_hat, v_hat)`` [T, latent_dim] f32.
 
-    Reference (non-fused) inverse of :func:`pack_kvarn_mla_tile`.
+    Reference (non-fused) inverse of :func:`pack_kvarn_mla_records`.
     """
-    records.shape[0]
     latent_dim = layout.latent_dim
     rec_f16 = records.view(torch.float16)
 
@@ -384,24 +381,14 @@ def unpack_kvarn_mla_tile(
         layout.v_bits,
         latent_dim,
     ).to(torch.float32)
+    k_scale = rec_f16[:, layout.k_scale_offset // 2].to(torch.float32)
+    k_zp = rec_f16[:, layout.k_zp_offset // 2].to(torch.float32)
     v_scale = rec_f16[:, layout.v_scale_offset // 2].to(torch.float32)
     v_zp = rec_f16[:, layout.v_zp_offset // 2].to(torch.float32)
-    k_row_scale = rec_f16[:, layout.k_row_scale_offset // 2].to(torch.float32)
 
-    tail_f16 = page_tail.view(torch.float16)
-    col_scale = tail_f16[0:latent_dim].to(torch.float32)
-    k_col_rt_scale = tail_f16[latent_dim : 2 * latent_dim].to(torch.float32)
-    k_col_rt_zp = tail_f16[2 * latent_dim : 3 * latent_dim].to(torch.float32)
-
-    # Score path: k_hat = (codes * rt_scale + rt_zp) * col_scale * row_scale.
-    k_hat = (k_codes * k_col_rt_scale.unsqueeze(0) + k_col_rt_zp.unsqueeze(0)) * (
-        col_scale.unsqueeze(0) * k_row_scale.unsqueeze(1)
-    )
-    # Value path: v_orig = (codes * v_scale + v_zp) * col_scale * row_scale
-    # (balanced frame rescaled to the original latent frame; the Hadamard
-    # inverse lives in the folded W_uv, not here).
-    v_hat = (v_codes * v_scale.unsqueeze(1) + v_zp.unsqueeze(1)) * (
-        col_scale.unsqueeze(0) * k_row_scale.unsqueeze(1)
-    )
+    # Score path: k_hat = codes * k_scale + k_zp (rotated frame).
+    k_hat = k_codes * k_scale.unsqueeze(1) + k_zp.unsqueeze(1)
+    # Value path: v_hat = codes * v_scale + v_zp (rotated frame).
+    v_hat = v_codes * v_scale.unsqueeze(1) + v_zp.unsqueeze(1)
 
     return k_hat, v_hat

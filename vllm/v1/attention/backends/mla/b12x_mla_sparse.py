@@ -1911,9 +1911,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if self._uses_kvarn_cache:
-            # Fresh pool per cache binding; stale shadows never survive a
-            # reconfiguration (the writer requires whole pages per call).
-            self._kvarn_shadow = None
             import os as _os
 
             if _os.environ.get("B12X_KVARN_DEBUG"):
@@ -1987,31 +1984,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 raise PreparationResourceUnavailableError(
                     f"{self._preparation_prefix()} has no declared cache_writer plan"
                 )
-            shadow = getattr(self, "_kvarn_shadow", None)
-            if shadow is None:
-                from vllm.v1.attention.ops.kvarn_page_shadow import (
-                    KvarnPageShadowPool,
-                )
-
-                shadow = KvarnPageShadowPool(
-                    self._kvarn_layout, kv_c_normed.device
-                )
-                self._kvarn_shadow = shadow
             # kv_c_normed is already Hadamard-rotated (MLA wrapper). The
-            # shadow emits whole pages; incomplete pages are re-quantized
-            # whole on every touch and finalized on completion.
-            for page_base, page_latents, _n_valid in shadow.stage_update(
-                kv_c_normed, slot_mapping.flatten()
-            ):
-                page_slots = torch.arange(
-                    page_base,
-                    page_base + shadow.group,
-                    dtype=slot_mapping.dtype,
-                    device=kv_c_normed.device,
-                )
-                self._concat_and_cache_glm_next_mla_kvarn(
-                    page_latents, kv_cache, page_slots, plan=plan
-                )
+            # per-token record scheme stores each token directly at its slot
+            # (inline scale/zp) -- no shadow pool, no whole-page re-quant, no
+            # host syncs; capture-safe at any batch size.
+            self._concat_and_cache_glm_next_mla_kvarn(
+                kv_c_normed, kv_cache, slot_mapping.flatten(), plan=plan
+            )
             return
         if self._uses_glm_dsa_nvfp4_cache:
             if kv_cache.numel() == 0:
