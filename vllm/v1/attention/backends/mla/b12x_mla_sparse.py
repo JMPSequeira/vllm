@@ -1485,17 +1485,25 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 kvarn_group=layout.group,
                 cache_record_bytes=layout.record_bytes,
             )
-            if mode != "decode":
-                # KVarN extend runs on the decode kernel: the MG prefill
-                # kernel has no KVARN_DUAL arm (its bulk-record IO requires
-                # 16B-aligned records), and at 16 local q heads (= one head
-                # group) the decode kernel amortizes the same KV gather.
-                caps_kwargs["mode"] = "decode"
+            if mode == "ckv_extend":
+                # The full-CKV gather route binds the tile-stride gathered
+                # arena (records + per-tile tail, mirroring the source pool),
+                # so one KV page equals one kernel tile: the decode kernel
+                # addresses records as block*tile_stride + row*record and
+                # every selected row lands at its true record offset. A flat
+                # (page, record) view shifts every tile past the first by
+                # its accumulated per-tile tails.
+                caps_kwargs["page_size"] = layout.group
+            if mode in ("extend", "ckv_extend"):
+                # MG prefill runs the KVARN_DUAL arm (scalar record IO --
+                # the 536B-class row is 8B- not 16B-aligned -- with inline
+                # dequant): keep the extend mode and the DCP-global padded
+                # head width the forward pass binds (64 = four 16-head MG
+                # groups replicated across CTAs; mg_n_hg==1 keeps one group
+                # per CTA in smem), and keep the full chunk count
+                # (ceil(topk / 64); MG carries no split-K scratch).
                 caps_kwargs["num_q_heads"] = self._kernel_num_heads
-                # 4096 rows saturate the SMs, so the split-K depth is tiny;
-                # the scratch is rows x chunks x heads x 512 x 2B and the
-                # uncapped chunk count (33) would over-provision it ~16x.
-                caps_kwargs["max_chunks_per_row"] = 2
+                caps_kwargs.pop("decode_max_rows", None)
         if self._uses_nvfp4_cache:
             caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         caps = self._module.Caps(**caps_kwargs)
@@ -1531,8 +1539,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             device=caps.device,
         )
         # Selection reads the real cache.  Page zero is a legal physical page
-        # and avoids a synthetic cache or a pool-sized checkpoint.
+        # and avoids a synthetic cache or a pool-sized checkpoint. The
+        # ckv_extend plan probes the full-CKV gather workspace as the runtime
+        # binds it -- a tile-stride arena view (page == tile, per-tile tail)
+        # -- so the prepared launcher compiles for the arena's address
+        # contract, not the source pool's.
         kv_cache = self._bound_kv_cache
+        if self._uses_kvarn_cache and int(caps.page_size) == self._kvarn_layout.group:
+            kv_cache = self._ckv_arena_probe()
         selected = torch.zeros(
             (rows, int(caps.max_width)), dtype=torch.int32, device=caps.device
         )
@@ -1571,6 +1585,31 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             produce=produce,
             # Closures retain probes until preparation has synchronized. The
             # published launcher binds live inputs and must not pin these probes.
+        )
+
+    def _ckv_arena_probe(self) -> torch.Tensor:
+        """Tile-stride arena view over the CKV gather workspace.
+
+        Mirrors :meth:`_gather_full_ckv`'s returned geometry: staging span
+        first, then one ``tile_stride_bytes`` tile per ``group`` gathered
+        tokens. The workspace persists (reserved at page-geometry
+        finalization), so prepared launchers retain a live binding.
+        """
+        specs = self._workspace_specs(
+            input_num_heads=self._kernel_num_heads, include_ckv=True
+        )
+        gathered = next(
+            workspace
+            for workspace in current_workspace_manager().get_simultaneous(*specs)
+            if workspace.shape[0] == self._ckv_gather_bytes()
+        )
+        layout = self._kvarn_layout
+        record = self._cache_record_bytes
+        capacity_rows = self.dcp_world_size * self._ckv_local_capacity
+        staging_bytes = capacity_rows * record
+        return gathered[staging_bytes:].as_strided(
+            (capacity_rows // layout.group, layout.group, record),
+            (layout.tile_stride_bytes, record, 1),
         )
 
     def get_b12x_preparation_units(
@@ -1709,19 +1748,41 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             else self._scratch_nbytes
         )
         scratch_spec = ((scratch_nbytes,), torch.uint8)
-        ckv_specs = (
-            (
+        if self._uses_kvarn_cache:
+            ckv_specs = (((self._ckv_gather_bytes(),), torch.uint8),)
+        else:
+            ckv_specs = (
                 (
-                    self.dcp_world_size * self._ckv_local_capacity,
-                    self._cache_record_bytes,
+                    (
+                        self.dcp_world_size * self._ckv_local_capacity,
+                        self._cache_record_bytes,
+                    ),
+                    torch.uint8,
                 ),
-                torch.uint8,
-            ),
-        )
+            )
         return (
             q_spec,
             scratch_spec,
             *(ckv_specs if include_ckv else ()),
+        )
+
+    def _ckv_gather_bytes(self) -> int:
+        """Bytes of the KVarN full-CKV gather workspace.
+
+        The KVarN decode kernel addresses the gathered cache in the pool's
+        tile geometry (``group`` records + per-tile tail), so the arena
+        mirrors it: a contiguous staging span for the NCCL all-gather plus
+        one tile-stride tile per ``group`` gathered tokens. Staging rows are
+        always a multiple of ``group``: per-rank capacity rounds to
+        ``page / gcd(page, dcp)`` tokens and the kernel page is a multiple
+        of the tile group.
+        """
+        rows = self.dcp_world_size * self._ckv_local_capacity
+        layout = self._kvarn_layout
+        assert rows % layout.group == 0
+        return (
+            rows * self._cache_record_bytes
+            + rows // layout.group * layout.tile_stride_bytes
         )
 
     def reserve_full_ckv_workspace(self) -> None:
@@ -2091,10 +2152,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"{self._cache_record_bytes}-byte records; "
                 f"got shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
             )
-        expected_gathered_shape = (
-            self.dcp_world_size * self._ckv_local_capacity,
-            self._cache_record_bytes,
-        )
+        capacity_rows = self.dcp_world_size * self._ckv_local_capacity
+        if self._uses_kvarn_cache:
+            # Tile-stride arena: staging span, then one tile per group tokens.
+            expected_gathered_shape = (self._ckv_gather_bytes(),)
+        else:
+            expected_gathered_shape = (capacity_rows, self._cache_record_bytes)
         if tuple(gathered_buffer.shape) != expected_gathered_shape:
             raise RuntimeError("CKV gathered workspace has an invalid shape")
 
@@ -2102,9 +2165,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         local_tokens = attn_metadata.dcp_local_total_tokens
         padded_tokens = attn_metadata.dcp_padded_total_tokens
         group = get_dcp_group()
+        if self._uses_kvarn_cache:
+            staging = gathered_buffer[
+                : capacity_rows * self._cache_record_bytes
+            ].view(capacity_rows, self._cache_record_bytes)
+        else:
+            staging = gathered_buffer
         # NCCL in-place all-gather reads each rank's contribution from its
         # receive slice. The stride is this call's padded count, not capacity.
-        local_buffer = gathered_buffer.narrow(
+        local_buffer = staging.narrow(
             0, group.rank_in_group * padded_tokens, padded_tokens
         )
         if local_tokens:
@@ -2120,8 +2189,27 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         _dcp_all_gather_current_stream(
             group,
             local_buffer[:padded_tokens].view(-1),
-            gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
+            staging[: self.dcp_world_size * padded_tokens].view(-1),
         )
+        if self._uses_kvarn_cache:
+            # Mirror the pool's tile geometry into the arena: the decode
+            # kernel addresses block*stride + tile*tile_stride + row*record
+            # from plan constants; with page == tile for the gathered cache
+            # every selected row lands at its true record offset.
+            layout = self._kvarn_layout
+            tile_tokens = int(layout.group)
+            record = self._cache_record_bytes
+            tile_stride = int(layout.tile_stride_bytes)
+            used_rows = self.dcp_world_size * padded_tokens
+            tiles = used_rows // tile_tokens
+            staging_bytes = capacity_rows * record
+            arena = gathered_buffer[staging_bytes:].as_strided(
+                (tiles, tile_tokens, record), (tile_stride, record, 1)
+            )
+            arena.view(tiles, tile_tokens * record).copy_(
+                staging[:used_rows].view(tiles, tile_tokens * record)
+            )
+            return arena
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
         )

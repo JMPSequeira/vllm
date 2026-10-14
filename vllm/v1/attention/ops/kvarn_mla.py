@@ -123,6 +123,12 @@ class KvarnMlaLayout:
         return self.record_bytes * self.group + self.page_tail_bytes_per_token * self.group
 
     @property
+    def tile_stride_bytes(self) -> int:
+        """Kernel tile stride: one tile of ``group`` records plus the reserved
+        per-tile tail region (mirrors b12x ``_TILE_TAIL_BYTES``)."""
+        return self.record_bytes * self.group + _KVARN_TILE_TAIL_BYTES
+
+    @property
     def k_code_offset(self) -> int:
         return 0
 
