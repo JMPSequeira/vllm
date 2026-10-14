@@ -108,3 +108,17 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_merge_tail_lse_nan_empty_segment():
+    # A fully-masked segment produces lse=-inf and NaN output; the merge
+    # must zero its contribution instead of propagating NaN (NaN * 0).
+    out_t = torch.tensor([[[1.0, 2.0]]], device="cuda")
+    out_b = torch.tensor([[[float("nan"), float("nan")]]], device="cuda")
+    m = merge_tail_lse(
+        out_t,
+        torch.tensor([[0.0]], device="cuda"),
+        out_b,
+        torch.tensor([[float("-inf")]], device="cuda"),
+    )
+    assert torch.allclose(m, out_t), m

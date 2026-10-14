@@ -1343,6 +1343,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             # records inside the kvarn pool; 0 disables the feature and
             # reproduces the stock per-token kvarn store byte-for-byte.
             self._kvarn_tail_local_tokens = 0
+            self._kvarn_tail_tokens = 0
             self._cache_writer_tail_plan = None
             self._concat_and_cache_glm_next_mla_fp8_tail = None
             tail_tokens = int(
@@ -1363,6 +1364,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         f"by the DCP world size ({dcp_size})"
                     )
                 self._kvarn_tail_local_tokens = tail_tokens // dcp_size
+                self._kvarn_tail_tokens = tail_tokens
                 self._concat_and_cache_glm_next_mla_fp8_tail = (
                     module.concat_and_cache_glm_next_mla_fp8_tail
                 )
@@ -1481,8 +1483,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         The decode launch is exact in its row count, so decode plans are
         declared per row count. The extend modes accept any row count up to
-        their declared capacity.
+        their declared capacity. ``decode_tail`` declares the precision-tail
+        segment: the KVARN_TAIL_FP8 arm (GLM fp8 math over 536B pool rows)
+        attending the dense tail window.
         """
+        tail_mode = mode == "decode_tail"
         caps_kwargs = dict(
             device=torch.device("cuda", torch.accelerator.current_device_index()),
             num_q_heads=(
@@ -1508,30 +1513,38 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             caps_kwargs["model_type"] = self._model_type
         if self._uses_kvarn_cache:
             layout = self._kvarn_layout
-            caps_kwargs.update(
-                scale_format=3,  # ScaleFormat.KVARN_DUAL
-                kvarn_k_bits=layout.k_bits,
-                kvarn_v_bits=layout.v_bits,
-                kvarn_group=layout.group,
-                cache_record_bytes=layout.record_bytes,
-            )
-            if mode == "ckv_extend":
-                # The full-CKV gather route binds the tile-stride gathered
-                # arena (records + per-tile tail, mirroring the source pool),
-                # so one KV page equals one kernel tile: the decode kernel
-                # addresses records as block*tile_stride + row*record and
-                # every selected row lands at its true record offset. A flat
-                # (page, record) view shifts every tile past the first by
-                # its accumulated per-tile tails.
-                caps_kwargs["page_size"] = layout.group
-            if mode in ("extend", "ckv_extend"):
-                # MG prefill runs the KVARN_DUAL arm (scalar record IO --
-                # the 536B-class row is 8B- not 16B-aligned -- with inline
-                # dequant): keep the extend mode and the DCP-global padded
-                # head width the forward pass binds (64 = four 16-head MG
-                # groups replicated across CTAs; mg_n_hg==1 keeps one group
-                # per CTA in smem), and keep the full chunk count
-                # (ceil(topk / 64); MG carries no split-K scratch).
+            if tail_mode:
+                # Precision-tail segment: dense always-attended window read
+                # by the fp8 arm; LSE is always required (two-launch merge).
+                caps_kwargs.update(
+                    model_type=int(self._module.ModelType.KVARN_TAIL_FP8),
+                    scale_format=1,  # ScaleFormat.ARBITRARY_FP32 (GLM fp8)
+                    max_width=self._kvarn_tail_local_tokens,
+                    max_chunks_per_row=max(
+                        1, (self._kvarn_tail_local_tokens + 63) // 64
+                    ),
+                    cache_record_bytes=layout.record_bytes,
+                    return_lse=True,
+                )
+            else:
+                caps_kwargs.update(
+                    scale_format=3,  # ScaleFormat.KVARN_DUAL
+                    kvarn_k_bits=layout.k_bits,
+                    kvarn_v_bits=layout.v_bits,
+                    kvarn_group=layout.group,
+                    cache_record_bytes=layout.record_bytes,
+                    # The body launch feeds the tail LSE merge.
+                    return_lse=(
+                        self.need_to_return_lse_for_decode
+                        or self._kvarn_tail_local_tokens > 0
+                    ),
+                )
+            if mode not in ("decode", "decode_tail"):
+                # KVarN extend runs on the decode kernel: the MG prefill
+                # kernel has no KVARN_DUAL arm (its bulk-record IO requires
+                # 16B-aligned records), and at 16 local q heads (= one head
+                # group) the decode kernel amortizes the same KV gather.
+                caps_kwargs["mode"] = "decode"
                 caps_kwargs["num_q_heads"] = self._kernel_num_heads
                 caps_kwargs.pop("decode_max_rows", None)
         if self._uses_nvfp4_cache:
@@ -1656,6 +1669,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             key = ("decode", rows)
             if rows <= self._decode_max_rows and key not in self._plans:
                 self._plan_caps[key], self._plans[key] = self._declare_plan(*key)
+            if (
+                self._uses_kvarn_cache
+                and self._kvarn_tail_local_tokens > 0
+                and rows <= self._decode_max_rows
+            ):
+                tail_key = ("decode_tail", rows)
+                if tail_key not in self._plans:
+                    self._plan_caps[tail_key], self._plans[tail_key] = (
+                        self._declare_plan(*tail_key)
+                    )
+                # The tail segment's split-K scratch can exceed the body's
+                # (N_local up to 4096 > topk 2048 chunks); the shared
+                # workspace reservation must cover the max.
+                self._scratch_nbytes = max(
+                    self._scratch_nbytes,
+                    int(self._plans[tail_key].scratch_specs()[0].nbytes),
+                )
         for key, declaration in self._plans.items():
             caps = self._plan_caps[key]
             requests.append(
@@ -2382,6 +2412,37 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
+        tail_active = (
+            self._uses_kvarn_cache
+            and self._kvarn_tail_local_tokens > 0
+            and not use_ckv_gather
+        )
+        if tail_active:
+            # Precision tail: drop body selections inside the tail window
+            # (they are attended densely by the tail segment instead).
+            # topk_indices are request-relative GLOBAL positions; the
+            # boundary is the global tail start per request.
+            from vllm.v1.attention.backends.mla.kvarn_tail import (
+                kvarn_tail_classify,
+                merge_tail_lse,
+            )
+
+            num_reqs = int(attn_metadata.num_reqs)
+            s_req = (
+                attn_metadata.dcp_global_seq_lens
+                if self.dcp_world_size > 1 and attn_metadata.dcp_global_seq_lens is not None
+                else attn_metadata.seq_lens
+            )[:num_reqs]
+            req_ids = attn_metadata.req_id_per_token[:num_tokens]
+            boundary_global = (
+                s_req[req_ids.to(torch.int64)] - self._kvarn_tail_tokens
+            ).clamp_min_(0)
+            torch.where(
+                topk_indices >= boundary_global[:, None],
+                torch.full((), -1, dtype=topk_indices.dtype, device=topk_indices.device),
+                topk_indices,
+                out=topk_indices,
+            )
         kv_cache_for_run = kv_c_and_k_pe_cache
         if use_ckv_gather:
             gathered_buffer = workspaces[2]
@@ -2494,6 +2555,61 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         result = self._run(binding)
         # The extend kernel returns LSE even when decode does not request it.
         output, lse = result if isinstance(result, tuple) else (result, None)
+        if tail_active:
+            # Second segment: the dense tail window through the fp8 arm,
+            # then an exact base-e LSE re-merge of the two normalized
+            # partial attentions (design doc §10.4).
+            from vllm.v1.attention.backends.mla.kvarn_tail import (
+                kvarn_tail_positions_to_slots,
+            )
+
+            n_local = self._kvarn_tail_local_tokens
+            csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
+            _, boundary_local, s_local = kvarn_tail_classify(
+                csl,
+                req_ids,
+                num_reqs,
+                n_local,
+            )
+            cols = torch.arange(n_local, device=csl.device)
+            pos = boundary_local[:, None] + cols[None, :]
+            valid = pos < s_local[:, None]
+            pos = torch.where(valid, pos, torch.zeros_like(pos))
+            tail_indices = kvarn_tail_positions_to_slots(
+                pos,
+                req_ids.unsqueeze(1).expand_as(pos),
+                attn_metadata.block_table,
+                attn_metadata.block_size,
+            )
+            tail_indices = torch.where(
+                valid, tail_indices, torch.full((), -1, dtype=tail_indices.dtype, device=tail_indices.device)
+            )
+            tail_lengths = (s_local - boundary_local).clamp_max_(n_local)
+            tail_plan = self._plan(("decode_tail", num_tokens))
+            tail_binding = self._bind(
+                tail_plan,
+                scratch=scratch,
+                q=q_all,
+                kv_cache=kv_cache_for_run,
+                selected_indices=tail_indices,
+                cache_lengths=cache_seq_lens,
+                selected_lengths=tail_lengths,
+            )
+            # The body launch's output may alias the shared kernel scratch;
+            # keep a private copy before the tail launch reuses it.
+            body_output = output.clone()
+            body_lse = lse.clone() if lse is not None else None
+            tail_result = self._run(tail_binding)
+            tail_output, tail_lse = (
+                tail_result if isinstance(tail_result, tuple) else (tail_result, None)
+            )
+            assert body_lse is not None and tail_lse is not None
+            output = merge_tail_lse(tail_output, tail_lse, body_output, body_lse)
+            lse = (
+                torch.logaddexp(tail_lse.float(), body_lse.float()).to(tail_lse.dtype)
+                if self.need_to_return_lse_for_decode
+                else None
+            )
         if kernel_num_heads != input_num_heads:
             # Fresh packed tensors: for one row, contiguous() would keep the
             # padded row stride, which the DCP collectives reject.

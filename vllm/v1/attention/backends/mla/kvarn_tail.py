@@ -160,7 +160,9 @@ def merge_tail_lse(
     wb = torch.exp(b - m)
     denom = wa + wb
     safe = denom > 0
-    out = (out_tail.float() * wa[..., None] + out_body.float() * wb[..., None]) / (
-        denom[..., None]
-    )
-    return torch.where(safe[..., None], out, out_tail.float()).to(out_tail.dtype)
+    # An empty segment (all candidates masked) has lse = -inf and a
+    # garbage/NaN normalized output; zero it so 0-weight rows stay clean.
+    at = torch.where((a > float("-inf"))[..., None], out_tail.float(), 0.0)
+    bt = torch.where((b > float("-inf"))[..., None], out_body.float(), 0.0)
+    out = (at * wa[..., None] + bt * wb[..., None]) / (denom[..., None])
+    return torch.where(safe[..., None], out, at).to(out_tail.dtype)
