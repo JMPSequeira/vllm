@@ -51,6 +51,11 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
+# KVarN dual-rate record widths (unambiguous vs the 528/304 GLM_NEXT dense
+# records); the kvarn kernels tile the cache at tile_stride rather than
+# densely, which moves the FP8 index tail offset (see _index_cache_view).
+_KVARN_RECORD_BYTES = (536, 600, 648, 400)
+_KVARN_TILE_TAIL_BYTES = 6400
 
 
 class Glm5NextIndexerScratch(nn.Module):
@@ -336,7 +341,18 @@ class Glm5NextPooledIndexer(nn.Module):
 
         subpages_per_parent = block_size // (_POOL_SIZE * _INDEX_PAGE_SIZE)
         parent_stride_bytes = int(main_cache.stride(0))
-        semantic_page_bytes = block_size * record_bytes
+        if record_bytes in _KVARN_RECORD_BYTES:
+            # KVarN kernels stride 256-token tiles at tile_stride (records +
+            # C4-rounded reserved tail), NOT densely: the latent span of a
+            # parent page is subpages_per_parent * tile_stride. Placing the
+            # FP8 index tail at the dense span put it inside the last tiles'
+            # records, and record writes clobbered it (selection degraded
+            # with context length).
+            tile_stride = (256 * record_bytes + _KVARN_TILE_TAIL_BYTES
+                           + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES * _INDEX_PAGE_BYTES
+            semantic_page_bytes = subpages_per_parent * tile_stride
+        else:
+            semantic_page_bytes = block_size * record_bytes
         index_tail_offset_bytes = (
             (semantic_page_bytes + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES
         ) * _INDEX_PAGE_BYTES
