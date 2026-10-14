@@ -2435,6 +2435,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     self._kvarn_layout,
                     interleave=int(attn_metadata.cp_kv_cache_interleave_size),
                 )
+                if os.environ.get("KVARN_TAIL_DEBUG") and (
+                    not torch.cuda.is_current_stream_capturing()
+                ):
+                    rows_all = gathered_buffer[
+                        : self.dcp_world_size * padded_tokens
+                    ].reshape(-1, self._cache_record_bytes)
+                    n_fp8_dense = int(
+                        (rows_all[:, 520:528] != 0).any(-1).sum().item()
+                    )
+                    logger.warning(
+                        "KVARN_TAIL_DEBUG gather: rows=%d fp8_after_demote=%d "
+                        "ts=%s local_total=%d",
+                        int(rows_all.shape[0]),
+                        n_fp8_dense,
+                        ts[: attn_metadata.num_reqs].tolist(),
+                        int(attn_metadata.dcp_local_total_tokens),
+                    )
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
         )
