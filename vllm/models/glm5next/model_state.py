@@ -375,6 +375,12 @@ class Glm5NextModelState(MambaHybridModelState):
             model_specific_attn_metadata=model_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            kvarn_tail_start=self.kvarn_tail_start_dev[:num_reqs]
+            if self.kvarn_tail_tokens
+            else None,
+            kvarn_tail_demote_ranges=self.kvarn_tail_demote_dev[:num_reqs]
+            if self.kvarn_tail_tokens
+            else None,
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(

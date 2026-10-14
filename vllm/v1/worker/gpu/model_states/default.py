@@ -35,6 +35,34 @@ class DefaultModelState(ModelState):
     ):
         super().__init__(vllm_config, model, encoder_cache, device)
 
+        # KVarN precision tail: persistent host/device ts + demotion-range
+        # buffers, filled per step by the model runner from the scheduler
+        # output. Persistent device buffers keep FULL-graph capture valid:
+        # the graph bakes the buffer addresses, the per-step eager H2D copy
+        # refreshes the values. None when the tail is disabled (the common
+        # metadata then carries None and the backend stores all-kvarn).
+        self.kvarn_tail_tokens = int(
+            getattr(vllm_config.cache_config, "kvarn_tail_tokens", 0) or 0
+        )
+        if self.kvarn_tail_tokens:
+            self.kvarn_tail_start_host = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, pin_memory=True
+            )
+            self.kvarn_tail_start_dev = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=device
+            )
+            self.kvarn_tail_demote_host = torch.zeros(
+                self.max_num_reqs, 2, dtype=torch.int32, pin_memory=True
+            )
+            self.kvarn_tail_demote_dev = torch.zeros(
+                self.max_num_reqs, 2, dtype=torch.int32, device=device
+            )
+        else:
+            self.kvarn_tail_start_host = None
+            self.kvarn_tail_start_dev = None
+            self.kvarn_tail_demote_host = None
+            self.kvarn_tail_demote_dev = None
+
         self.prompt_embeds_state: PromptEmbedsState | None = None
         if self.model_config.enable_prompt_embeds:
             self.prompt_embeds_state = PromptEmbedsState(
@@ -247,5 +275,11 @@ class DefaultModelState(ModelState):
             req_idx=input_batch.idx_mapping_np,
             ubatch_idx=ubatch_idx,
             fast_prefill=input_batch.fast_prefill,
+            kvarn_tail_start=self.kvarn_tail_start_dev[:num_reqs]
+            if self.kvarn_tail_tokens
+            else None,
+            kvarn_tail_demote_ranges=self.kvarn_tail_demote_dev[:num_reqs]
+            if self.kvarn_tail_tokens
+            else None,
         )
         return attn_metadata

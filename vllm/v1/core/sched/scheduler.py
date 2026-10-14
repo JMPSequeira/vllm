@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -2128,6 +2129,12 @@ class Scheduler(SchedulerInterface):
             if self.kv_cache_manager.kvarn_tail_tokens
             else {}
         )
+        if os.environ.get("KVARN_TAIL_DEBUG") and kvarn_tail_starts:
+            logger.warning(
+                "KVARN_TAIL_DEBUG scheduler: starts=%s demotions=%s",
+                kvarn_tail_starts,
+                kvarn_tail_demotions,
+            )
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens

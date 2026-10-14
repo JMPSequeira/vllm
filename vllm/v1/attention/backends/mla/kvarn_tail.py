@@ -34,6 +34,35 @@ def kvarn_tail_boundary(
     return tail_start.to(torch.int32)[req_id_per_token.to(torch.int64)]
 
 
+
+def kvarn_tail_local_row_start(
+    tail_start: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+    interleave: int,
+) -> torch.Tensor:
+    """First LOCAL row index of rank ``dcp_rank`` at/after global ts.
+
+    Manager ts is a GLOBAL request-relative position (positions >= ts are
+    fp8). With interleaved DCP ownership, rank r owns global positions
+    ``g = (g // (i*ws)) * (i*ws) + r*i + (g % i)``; the number of its
+    local rows below ts is::
+
+        t    = max(ts - r*i, 0)
+        j_lo = (t // (i*ws)) * i + min(t % (i*ws), i)
+
+    Verified exhaustively for i in (1, 2, 4), ws in (1, 2, 4) against the
+    brute-force ownership map in tests.
+    """
+    i = max(1, int(interleave))
+    ws = max(1, int(dcp_world_size))
+    ts = tail_start.to(torch.int64)
+    t = (ts - int(dcp_rank) * i).clamp_min_(0)
+    return (
+        (t // (i * ws)) * i + (t % (i * ws)).clamp_max_(i)
+    ).to(torch.int32)
+
+
 def kvarn_tail_global_boundary(
     tail_start: torch.Tensor,
     req_id_per_token: torch.Tensor,
@@ -156,6 +185,9 @@ def _kvarn_tail_demote_ranges_kernel(
     group: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     CHUNK: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
 ):
     """Demote every fp8 record in each request's [lo, hi) position range.
 
@@ -172,7 +204,23 @@ def _kvarn_tail_demote_ranges_kernel(
         return
     end = tl.minimum(hi, start + CHUNK)
 
-    for pos in range(start, end):
+    # Ranges are GLOBAL request-relative positions; the pool block table
+    # maps LOCAL rows (this rank's owned records) to slots. Convert both
+    # endpoints to local row indices (see kvarn_tail_local_row_start).
+    t_lo = tl.maximum(lo - DCP_RANK * INTERLEAVE, 0)
+    j_lo = (t_lo // (INTERLEAVE * DCP_SIZE)) * INTERLEAVE + tl.minimum(
+        t_lo % (INTERLEAVE * DCP_SIZE), INTERLEAVE
+    )
+    t_hi = tl.maximum(end - DCP_RANK * INTERLEAVE, 0)
+    j_hi = (t_hi // (INTERLEAVE * DCP_SIZE)) * INTERLEAVE + tl.minimum(
+        t_hi % (INTERLEAVE * DCP_SIZE), INTERLEAVE
+    )
+    start_j = j_lo + chunk * CHUNK
+    if start_j >= j_hi:
+        return
+    end_j = tl.minimum(j_hi, start_j + CHUNK)
+
+    for pos in range(start_j, end_j):
         blk = tl.load(block_table_ptr + req.to(tl.int64) * max_blocks + pos // BLOCK_SIZE)
         slot = blk * BLOCK_SIZE + pos % BLOCK_SIZE
         base = (
@@ -192,6 +240,9 @@ def kvarn_tail_demote_ranges(
     block_size: int,
     layout,
     num_tokens: int,
+    dcp_rank: int = 0,
+    dcp_size: int = 1,
+    interleave: int = 1,
 ) -> None:
     """Re-quantize fp8 records to kvarn over per-request position ranges.
 
@@ -237,6 +288,9 @@ def kvarn_tail_demote_ranges(
         group=128,
         BLOCK_SIZE=block_size,
         CHUNK=256,
+        DCP_RANK=int(dcp_rank),
+        DCP_SIZE=int(dcp_size),
+        INTERLEAVE=int(interleave),
         num_warps=4,
     )
 
@@ -255,6 +309,8 @@ def _kvarn_tail_demote_gathered_kernel(
     PADDED: tl.constexpr,
     WS: tl.constexpr,
     CHUNK: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
 ):
     """Demote the fp8 tail rows of a gathered dense CKV buffer.
 
@@ -269,7 +325,13 @@ def _kvarn_tail_demote_gathered_kernel(
     cu_start = tl.load(cu_ptr + req)
     cu_end = tl.load(cu_ptr + req + 1)
     ts = tl.load(ts_ptr + req)
-    row0 = rank * PADDED + cu_start + ts + chunk * CHUNK
+    # ts is a GLOBAL request-relative position; the gathered buffer rows
+    # are this rank's LOCAL rows. Convert (see kvarn_tail_local_row_start).
+    t = tl.maximum(ts - rank * INTERLEAVE, 0)
+    j_lo = (t // (INTERLEAVE * DCP_SIZE)) * INTERLEAVE + tl.minimum(
+        t % (INTERLEAVE * DCP_SIZE), INTERLEAVE
+    )
+    row0 = rank * PADDED + cu_start + j_lo + chunk * CHUNK
     row_end = rank * PADDED + cu_end
     if row0 >= row_end:
         return
@@ -288,6 +350,7 @@ def kvarn_tail_demote_gathered(
     padded_tokens: int,
     dcp_world_size: int,
     layout,
+    interleave: int = 1,
 ) -> None:
     """Demote fp8 tail rows of the gathered dense CKV buffer in place.
 
@@ -318,6 +381,8 @@ def kvarn_tail_demote_gathered(
         PADDED=padded_tokens,
         WS=dcp_world_size,
         CHUNK=256,
+        DCP_SIZE=int(dcp_world_size),
+        INTERLEAVE=int(interleave),
         num_warps=4,
     )
 

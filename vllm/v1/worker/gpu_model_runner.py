@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4278,6 +4279,8 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if os.environ.get("KVARN_TAIL_DEBUG"):
+            logger.warning("KVARN_TAIL_DEBUG execute_model entry")
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4417,6 +4420,12 @@ class GPUModelRunner(
             # common-metadata build below.
             self._kvarn_tail_starts_step = scheduler_output.kvarn_tail_starts
             self._kvarn_tail_demotions_step = scheduler_output.kvarn_tail_demotions
+            if os.environ.get("KVARN_TAIL_DEBUG"):
+                logger.warning(
+                    "KVARN_TAIL_DEBUG runner4418: starts=%s demotions=%s",
+                    scheduler_output.kvarn_tail_starts,
+                    scheduler_output.kvarn_tail_demotions,
+                )
 
             # True if any attention backend handles KV cache update separately
             # from forward() (i.e., forward_includes_kv_cache_update=False). When true,

@@ -153,3 +153,23 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("interleave", [1, 2, 4])
+@pytest.mark.parametrize("ws", [1, 2, 4])
+@pytest.mark.parametrize("ts", [0, 16, 64, 256, 1000])
+def test_local_row_start_matches_ownership(interleave, ws, ts):
+    """kvarn_tail_local_row_start == brute-force owned-position count."""
+    from vllm.v1.attention.backends.mla.kvarn_tail import (
+        kvarn_tail_local_row_start,
+    )
+
+    S = 2048
+    owned = [g for g in range(S) if (g // interleave) % ws == 0]
+    expect = sum(1 for g in owned if g < ts)
+    got = int(
+        kvarn_tail_local_row_start(
+            torch.tensor([ts], dtype=torch.int32), 0, ws, interleave
+        ).item()
+    )
+    assert got == expect

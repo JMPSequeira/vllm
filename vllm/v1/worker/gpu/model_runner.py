@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 """
 
 import functools
+import os
 import gc
 import time
 from collections.abc import Callable
@@ -2030,6 +2031,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     boundary_aux_block_id=checkpoint.auxiliary_block_ids[0],
                 )
                 return None
+            # KVarN precision tail: refresh the persistent ts/demotion
+            # buffers from this step's scheduler state (host fill + H2D
+            # copy; eager, before any capture region).
+            if os.environ.get("KVARN_TAIL_DEBUG"):
+                logger.warning(
+                    "KVARN_TAIL_DEBUG v2fill: tail_tokens=%s starts=%s",
+                    self.model_state.kvarn_tail_tokens,
+                    dict(list(scheduler_output.kvarn_tail_starts.items())[:2]),
+                )
+            if self.model_state.kvarn_tail_tokens:
+                ms = self.model_state
+                starts = scheduler_output.kvarn_tail_starts
+                demotions = scheduler_output.kvarn_tail_demotions
+                req_ids = input_batch.req_ids
+                n = len(req_ids)
+                for i, rid in enumerate(req_ids):
+                    ms.kvarn_tail_start_host[i] = starts.get(rid, 0)
+                if n < ms.kvarn_tail_start_host.shape[0]:
+                    ms.kvarn_tail_start_host[n:].zero_()
+                ms.kvarn_tail_demote_host.zero_()
+                for rid, (lo, hi) in demotions.items():
+                    ms.kvarn_tail_demote_host[req_ids.index(rid), 0] = lo
+                    ms.kvarn_tail_demote_host[req_ids.index(rid), 1] = hi
+                ms.kvarn_tail_start_dev.copy_(
+                    ms.kvarn_tail_start_host, non_blocking=True
+                )
+                ms.kvarn_tail_demote_dev.copy_(
+                    ms.kvarn_tail_demote_host, non_blocking=True
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

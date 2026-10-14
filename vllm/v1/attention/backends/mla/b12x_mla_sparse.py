@@ -18,6 +18,7 @@ from vllm.distributed import get_dcp_group
 from vllm.distributed.device_communicators.all_reduce_utils import (
     should_nccl_symm_mem_ag_rs,
 )
+import os
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
@@ -704,6 +705,7 @@ class B12xMLASparseMetadata(SparseMLACommonMetadata):
     dcp_global_seq_lens: torch.Tensor | None = None
     kvarn_tail_start: torch.Tensor | None = None
     kvarn_tail_demote_ranges: torch.Tensor | None = None
+    global_positions: torch.Tensor | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
     prefill_seq_lens_cpu: torch.Tensor | None = None
     cache_seq_lens_per_token: torch.Tensor | None = None
@@ -979,6 +981,19 @@ class B12xMLASparseMetadataBuilder(
 
         metadata.cache_seq_lens_per_token = per_token_lens
         metadata.kvarn_tail_start = getattr(common, "kvarn_tail_start", None)
+        metadata.global_positions = (
+            common.positions[:num_tokens]
+            if common.positions is not None
+            else None
+        )
+        if os.environ.get("KVARN_TAIL_DEBUG"):
+            logger.warning(
+                "KVARN_TAIL_DEBUG bld: common_type=%s tail=%s",
+                type(common).__name__,
+                None
+                if metadata.kvarn_tail_start is None
+                else metadata.kvarn_tail_start.shape,
+            )
         metadata.kvarn_tail_demote_ranges = getattr(
             common, "kvarn_tail_demote_ranges", None
         )
@@ -1368,6 +1383,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     raise ValueError(
                         f"--kvarn-tail-tokens ({tail_tokens}) must be divisible "
                         f"by the DCP world size ({dcp_size})"
+                    )
+                if dcp_size == 1:
+                    # The b12x fp8 arm is decode-only (commit 63a86aed); the
+                    # MG prefill kernel has no KVARN_TAIL_FP8 shape. DCP2
+                    # extends read the tail through the ckv-gather +
+                    # gathered-demote + MG-kvarn route; DCP1 extends have no
+                    # sound read path, so refuse instead of serving garbage.
+                    raise ValueError(
+                        "--kvarn-tail-tokens currently requires "
+                        "--decode-context-parallel-size 2 (the fp8 tail arm "
+                        "is decode-only; DCP1 extends have no fp8 read path)"
                     )
                 self._kvarn_tail_local_tokens = tail_tokens // dcp_size
                 self._kvarn_tail_tokens = tail_tokens
@@ -2223,7 +2249,49 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     attn_metadata.block_size,
                     self._kvarn_layout,
                     num_tokens,
+                    dcp_rank=self.dcp_rank,
+                    dcp_size=self.dcp_world_size,
+                    interleave=int(attn_metadata.cp_kv_cache_interleave_size),
                 )
+            if os.environ.get("KVARN_TAIL_DEBUG") and (
+                not torch.cuda.is_current_stream_capturing()
+            ):
+                valid = slots[slots >= 0][:8192]
+                if valid.numel():
+                    rows = kv_cache.reshape(-1, self._cache_record_bytes)[
+                        valid.to(torch.int64)
+                    ]
+                    # kvarn pad bytes [520,528) are zero; fp8 group scales
+                    # make them nonzero (unit-latent groups excluded).
+                    n_fp8 = int((rows[:, 520:528] != 0).any(-1).sum().item())
+                    owned = slots >= 0
+                    csl_v = attn_metadata.cache_seq_lens_per_token[:num_tokens][owned]
+                    ts_v = (
+                        boundary[owned]
+                        if boundary is not None
+                        else None
+                    )
+                    logger.warning(
+                        "KVARN_TAIL_DEBUG store: tokens=%d prefills=%d "
+                        "slots=%d fp8=%d kvarn=%d ts=%s csl_min=%d "
+                        "kvarn_csl_max=%s",
+                        num_tokens,
+                        attn_metadata.num_prefills,
+                        int(valid.numel()),
+                        n_fp8,
+                        int(valid.numel()) - n_fp8,
+                        (
+                            ts[: attn_metadata.num_reqs].tolist()
+                            if ts is not None
+                            else None
+                        ),
+                        int(csl_v.min().item()),
+                        (
+                            int(csl_v[~(csl_v - 1 >= ts_v)].max().item())
+                            if ts_v is not None and not bool((csl_v - 1 >= ts_v).all())
+                            else None
+                        ),
+                    )
             return
         if self._uses_glm_dsa_nvfp4_cache:
             if kv_cache.numel() == 0:
@@ -2365,6 +2433,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     padded_tokens,
                     self.dcp_world_size,
                     self._kvarn_layout,
+                    interleave=int(attn_metadata.cp_kv_cache_interleave_size),
                 )
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
@@ -2456,19 +2525,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             # when ts is a multiple of the interleave size, which block
             # alignment guarantees).
             from vllm.v1.attention.backends.mla.kvarn_tail import (
-                kvarn_tail_global_boundary,
+                kvarn_tail_boundary,
                 merge_tail_lse,
             )
 
             num_reqs = int(attn_metadata.num_reqs)
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
-            boundary_global = kvarn_tail_global_boundary(
-                ts[:num_reqs],
-                req_ids,
-                self.dcp_rank,
-                self.dcp_world_size,
-                int(attn_metadata.cp_kv_cache_interleave_size),
-            )
+            # ts is already a GLOBAL request-relative position; topk
+            # candidates are global positions too.
+            boundary_global = kvarn_tail_boundary(ts[:num_reqs], req_ids)
             torch.where(
                 topk_indices >= boundary_global[:, None],
                 torch.full((), -1, dtype=topk_indices.dtype, device=topk_indices.device),
@@ -2598,16 +2663,21 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             n_local = self._kvarn_tail_local_tokens
             csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
             ts = getattr(attn_metadata, "kvarn_tail_start", None)
-            boundary_local = ts[:num_reqs][req_ids.to(torch.int64)]
-            # S_r per request: segment max of csl by req_id, per token.
-            s_per_req = torch.zeros(num_reqs, dtype=torch.int32, device=csl.device)
-            s_per_req.scatter_reduce_(
-                0,
-                req_ids.to(torch.int64),
-                csl,
-                reduce="amax",
+            from vllm.v1.attention.backends.mla.kvarn_tail import (
+                kvarn_tail_local_row_start,
             )
-            s_local = s_per_req[req_ids.to(torch.int64)]
+
+            boundary_local = kvarn_tail_local_row_start(
+                ts[:num_reqs],
+                self.dcp_rank,
+                self.dcp_world_size,
+                int(attn_metadata.cp_kv_cache_interleave_size),
+            )[req_ids.to(torch.int64)]
+            # Per-token local sequence length: rows are causal tokens, so
+            # each row's tail window ends at its OWN cache length (extend
+            # rows within a chunk have distinct, increasing S -- a
+            # request-max would let early rows attend future tokens).
+            s_local = csl
             cols = torch.arange(n_local, device=csl.device)
             pos = boundary_local[:, None] + cols[None, :]
             valid = pos < s_local[:, None]
@@ -2621,7 +2691,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             tail_indices = torch.where(
                 valid, tail_indices, torch.full((), -1, dtype=tail_indices.dtype, device=tail_indices.device)
             )
-            tail_lengths = (s_local - boundary_local).clamp_max_(n_local)
+            tail_lengths = (s_local - boundary_local).clamp_(min=0).clamp_max_(n_local)
             tail_plan = self._plan(
                 ("decode_tail", num_tokens)
                 if plan_key[0] == "decode"
