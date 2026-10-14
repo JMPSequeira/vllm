@@ -2519,21 +2519,21 @@ class GPUModelRunner(
 
         # KVarN precision tail: per-request hit lengths + demotion ranges
         # (host-built each step; empty when the tail is disabled).
-        kvarn_tail_hit_len = None
+        kvarn_tail_start = None
         kvarn_tail_demote_ranges = None
-        kvarn_tail_hit_lens = getattr(self, "_kvarn_tail_hit_lens_step", None) or {}
-        if kvarn_tail_hit_lens:
-            kvarn_tail_hit_len = torch.zeros(
+        kvarn_tail_starts = getattr(self, "_kvarn_tail_starts_step", None) or {}
+        if kvarn_tail_starts:
+            kvarn_tail_start = torch.zeros(
                 num_reqs_padded, dtype=torch.int32, device=self.device
             )
             kvarn_tail_demote_ranges = torch.zeros(
                 num_reqs_padded, 2, dtype=torch.int32, device=self.device
             )
             req_index = self.input_batch.req_id_to_index
-            for req_id, hit in kvarn_tail_hit_lens.items():
+            for req_id, ts in kvarn_tail_starts.items():
                 idx = req_index.get(req_id)
                 if idx is not None and idx < num_reqs_padded:
-                    kvarn_tail_hit_len[idx] = hit
+                    kvarn_tail_start[idx] = ts
             for req_id, (lo, hi) in (
                 getattr(self, "_kvarn_tail_demotions_step", None) or {}
             ).items():
@@ -2559,7 +2559,7 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
-            kvarn_tail_hit_len=kvarn_tail_hit_len,
+            kvarn_tail_start=kvarn_tail_start,
             kvarn_tail_demote_ranges=kvarn_tail_demote_ranges,
         )
 
@@ -4415,7 +4415,7 @@ class GPUModelRunner(
 
             # KVarN precision tail: per-step scheduler state consumed by the
             # common-metadata build below.
-            self._kvarn_tail_hit_lens_step = scheduler_output.kvarn_tail_hit_lens
+            self._kvarn_tail_starts_step = scheduler_output.kvarn_tail_starts
             self._kvarn_tail_demotions_step = scheduler_output.kvarn_tail_demotions
 
             # True if any attention backend handles KV cache update separately

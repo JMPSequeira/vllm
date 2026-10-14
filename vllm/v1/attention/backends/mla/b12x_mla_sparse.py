@@ -702,7 +702,7 @@ class B12xGLM5NextMLASparseBackend(B12xMLASparseBackend):
 @dataclass
 class B12xMLASparseMetadata(SparseMLACommonMetadata):
     dcp_global_seq_lens: torch.Tensor | None = None
-    kvarn_tail_hit_len: torch.Tensor | None = None
+    kvarn_tail_start: torch.Tensor | None = None
     kvarn_tail_demote_ranges: torch.Tensor | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
     prefill_seq_lens_cpu: torch.Tensor | None = None
@@ -978,7 +978,7 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
 
         metadata.cache_seq_lens_per_token = per_token_lens
-        metadata.kvarn_tail_hit_len = getattr(common, "kvarn_tail_hit_len", None)
+        metadata.kvarn_tail_start = getattr(common, "kvarn_tail_start", None)
         metadata.kvarn_tail_demote_ranges = getattr(
             common, "kvarn_tail_demote_ranges", None
         )
@@ -2175,35 +2175,44 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     kv_c_normed, kv_cache, slots, plan=plan
                 )
                 return
-            # Precision tail: newest N tokens store fp8_ds_mla records
-            # inside the 536B slots; older tokens store kvarn records; the
-            # block-aligned boundary crossing re-quantizes the exiting
-            # records in place. Dispatch is shape-static: both writers see
+            # Precision tail: decode-phase stores split fp8 (pos >= ts) vs
+            # kvarn (pos < ts); EXTEND steps store everything as kvarn (the
+            # manager reset ts to S and emitted a demote range covering the
+            # whole decode-phase tail, so the ckv gather always sees
+            # uniform kvarn). Dispatch is shape-static: both writers see
             # the full batch with non-mine slots masked to -1 (writers skip
             # slot < 0).
             from vllm.v1.attention.backends.mla.kvarn_tail import (
-                kvarn_tail_classify,
+                kvarn_tail_boundary,
                 kvarn_tail_demote_ranges,
             )
 
             num_tokens = slots.shape[0]
-            csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
-            n_local = self._kvarn_tail_local_tokens
-            hit_len = getattr(attn_metadata, "kvarn_tail_hit_len", None)
-            is_tail, boundary, _ = kvarn_tail_classify(
-                csl, req_ids, attn_metadata.num_reqs, n_local, hit_len,
-                attn_metadata.block_size,
-            )
-            tail_slots = torch.where(is_tail.bool(), slots, slots.new_full((), -1))
-            body_slots = torch.where(is_tail.bool(), slots.new_full((), -1), slots)
-            self._module.concat_and_cache_glm_next_mla_fp8_tail(
-                kv_c_normed, kv_cache, tail_slots, plan=tail_plan
-            )
-            self._concat_and_cache_glm_next_mla_kvarn(
-                kv_c_normed, kv_cache, body_slots, plan=plan
-            )
             demote_ranges = getattr(attn_metadata, "kvarn_tail_demote_ranges", None)
+            if attn_metadata.num_prefills > 0:
+                self._concat_and_cache_glm_next_mla_kvarn(
+                    kv_c_normed, kv_cache, slots, plan=plan
+                )
+            else:
+                csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
+                ts = getattr(attn_metadata, "kvarn_tail_start", None)
+                boundary = kvarn_tail_boundary(
+                    ts[: attn_metadata.num_reqs], req_ids
+                )
+                is_tail = (csl - 1) >= boundary
+                tail_slots = torch.where(
+                    is_tail.bool(), slots, slots.new_full((), -1)
+                )
+                body_slots = torch.where(
+                    is_tail.bool(), slots.new_full((), -1), slots
+                )
+                self._module.concat_and_cache_glm_next_mla_fp8_tail(
+                    kv_c_normed, kv_cache, tail_slots, plan=tail_plan
+                )
+                self._concat_and_cache_glm_next_mla_kvarn(
+                    kv_c_normed, kv_cache, body_slots, plan=plan
+                )
             if demote_ranges is not None:
                 kvarn_tail_demote_ranges(
                     kv_cache,
@@ -2450,22 +2459,24 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             # Precision tail: drop body selections inside the tail window
             # (they are attended densely by the tail segment instead).
             # topk_indices are request-relative GLOBAL positions; the
-            # boundary is the global tail start per request.
+            # manager-owned local ts converts to a global boundary (exact
+            # when ts is a multiple of the interleave size, which block
+            # alignment guarantees).
             from vllm.v1.attention.backends.mla.kvarn_tail import (
-                kvarn_tail_classify,
+                kvarn_tail_global_boundary,
                 merge_tail_lse,
             )
 
             num_reqs = int(attn_metadata.num_reqs)
-            s_req = (
-                attn_metadata.dcp_global_seq_lens
-                if self.dcp_world_size > 1 and attn_metadata.dcp_global_seq_lens is not None
-                else attn_metadata.seq_lens
-            )[:num_reqs]
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
-            boundary_global = (
-                s_req[req_ids.to(torch.int64)] - self._kvarn_tail_tokens
-            ).clamp_min_(0)
+            ts = getattr(attn_metadata, "kvarn_tail_start", None)
+            boundary_global = kvarn_tail_global_boundary(
+                ts[:num_reqs],
+                req_ids,
+                self.dcp_rank,
+                self.dcp_world_size,
+                int(attn_metadata.cp_kv_cache_interleave_size),
+            )
             torch.where(
                 topk_indices >= boundary_global[:, None],
                 torch.full((), -1, dtype=topk_indices.dtype, device=topk_indices.device),
@@ -2594,14 +2605,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
             n_local = self._kvarn_tail_local_tokens
             csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
-            _, boundary_local, s_local = kvarn_tail_classify(
+            ts = getattr(attn_metadata, "kvarn_tail_start", None)
+            boundary_local = ts[:num_reqs][req_ids.to(torch.int64)]
+            # S_r per request: segment max of csl by req_id, per token.
+            s_per_req = torch.zeros(num_reqs, dtype=torch.int32, device=csl.device)
+            s_per_req.scatter_reduce_(
+                0,
+                req_ids.to(torch.int64),
                 csl,
-                req_ids,
-                num_reqs,
-                n_local,
-                getattr(attn_metadata, "kvarn_tail_hit_len", None),
-                attn_metadata.block_size,
+                reduce="amax",
             )
+            s_local = s_per_req[req_ids.to(torch.int64)]
             cols = torch.arange(n_local, device=csl.device)
             pos = boundary_local[:, None] + cols[None, :]
             valid = pos < s_local[:, None]

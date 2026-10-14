@@ -11,8 +11,9 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends.mla.kvarn_tail import (
-    kvarn_tail_classify,
+    kvarn_tail_boundary,
     kvarn_tail_demote_ranges,
+    kvarn_tail_global_boundary,
     merge_tail_lse,
 )
 from vllm.v1.attention.ops.kvarn_demote import demote_fp8_records
@@ -29,27 +30,32 @@ def _layout() -> KvarnMlaLayout:
     return KvarnMlaLayout(k_bits=4, v_bits=4, group=256)
 
 
-def test_classify_block_aligned_boundary():
-    # S=101, N=50, bs=16: raw = 51 -> aligned = 64. Position 100 (csl 101)
-    # is tail; a body token at pos 63 (csl 64) sits below the boundary.
+def test_boundary_from_ts():
+    # The manager owns ts; the per-token boundary is a plain gather.
+    ts = torch.tensor([64], dtype=torch.int32, device="cuda")
+    req = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
     csl = torch.tensor([101, 64], dtype=torch.int32, device="cuda")
-    req = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
-    is_tail, boundary, s_tok = kvarn_tail_classify(csl, req, 1, 50, None, BLOCK)
+    boundary = kvarn_tail_boundary(ts, req)
     assert boundary.tolist() == [64, 64]
-    assert s_tok.tolist() == [101, 101]
-    assert is_tail.tolist() == [1, 0]
+    # pos 100 (csl 101) is tail; pos 63 (csl 64) is body.
+    assert ((csl - 1) >= boundary).tolist() == [True, False]
 
 
-def test_classify_hit_clamp():
-    # Hit request: H=200 covers S=201 entirely; the boundary must never dip
-    # into the published (kvarn) prefix even when S-N < H.
-    csl = torch.tensor([201, 221], dtype=torch.int32, device="cuda")
+def test_global_boundary_dcp2_interleave4():
+    # DCP2, interleave 4: local j owns globals [8j, 8j+4) for rank 0 and
+    # [8j+4, 8j+8) for rank 1. ts=8 (local) -> rank 0: g=16, rank 1: g=20.
+    ts = torch.tensor([8], dtype=torch.int32, device="cuda")
+    req = torch.tensor([0], dtype=torch.int32, device="cuda")
+    g0 = kvarn_tail_global_boundary(ts, req, 0, 2, 4)
+    g1 = kvarn_tail_global_boundary(ts, req, 1, 2, 4)
+    assert g0.item() == 16 and g1.item() == 20
+
+
+def test_global_boundary_dcp1():
+    ts = torch.tensor([64], dtype=torch.int32, device="cuda")
     req = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
-    hit = torch.tensor([200], dtype=torch.int32, device="cuda")
-    is_tail, boundary, _ = kvarn_tail_classify(csl, req, 1, 50, hit, BLOCK)
-    # raw = align_up(201-50)=160 -> max(160, 200) = 200; pos 200 tail.
-    assert boundary.tolist() == [200, 200]
-    assert is_tail.tolist() == [1, 1]
+    g = kvarn_tail_global_boundary(ts, req, 0, 1, 1)
+    assert g.tolist() == [64, 64]
 
 
 def test_demote_ranges_matches_slot_list():

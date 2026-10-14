@@ -456,11 +456,11 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
-    kvarn_tail_hit_len: torch.Tensor | None = None
-    """(batch_size,) int32: per-request prefix-hit length H for the kvarn
-    precision tail (tokens the request did not store itself). The tail
-    boundary never extends below H, so published (shared) blocks always
-    read as kvarn records. None when the tail is disabled."""
+    kvarn_tail_start: torch.Tensor | None = None
+    """(batch_size,) int32: per-request tail start ts for the kvarn
+    precision tail (fp8 region = [ts, S), DCP-local positions). The
+    manager owns ts; extends reset it to S so gathers always read kvarn.
+    None when the tail is disabled."""
 
     kvarn_tail_demote_ranges: torch.Tensor | None = None
     """(batch_size, 2) int32: per-request [lo, hi) position range whose fp8

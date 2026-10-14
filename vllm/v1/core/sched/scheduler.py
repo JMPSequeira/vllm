@@ -2120,9 +2120,9 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         kvarn_tail_demotions = self.kv_cache_manager.take_kvarn_tail_demotions()
-        kvarn_tail_hit_lens = (
+        kvarn_tail_starts = (
             {
-                req_id: self.kv_cache_manager._kvarn_tail_hit_len.get(req_id, 0)
+                req_id: self.kv_cache_manager._kvarn_tail_start.get(req_id, 0)
                 for req_id in num_scheduled_tokens
             }
             if self.kv_cache_manager.kvarn_tail_tokens
@@ -2197,7 +2197,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
-            kvarn_tail_hit_lens=kvarn_tail_hit_lens,
+            kvarn_tail_starts=kvarn_tail_starts,
             kvarn_tail_demotions=kvarn_tail_demotions,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,

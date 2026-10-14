@@ -188,13 +188,14 @@ class KVCacheManager:
         kvarn_tail_tokens: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
-        # KVarN precision tail (lil/kvarn-mla-design.md §10): newest N tokens
-        # of each request hold fp8 records and are NEVER published to the
-        # prefix cache, so published blocks are uniformly kvarn and demotion
-        # writes stay on request-private blocks. 0 disables the feature and
+        # KVarN precision tail: decode-phase-only recency window. The tail
+        # region [ts, S) holds fp8 records and is NEVER published to the
+        # prefix cache; at every extend (prefill chunk) the whole tail is
+        # demoted to kvarn and ts resets to S, so the ckv gather always
+        # reads uniform kvarn records and prompts stay fully cacheable.
+        # Decode allocations grow the tail; 0 disables the feature and
         # reproduces the stock caching behavior exactly.
         self.kvarn_tail_tokens = int(kvarn_tail_tokens)
-        self._kvarn_tail_hit_len: dict[str, int] = {}
         self._kvarn_tail_start: dict[str, int] = {}
         self._kvarn_tail_demotions: list[tuple[str, int, int]] = []
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -792,25 +793,34 @@ class KVCacheManager:
             request.num_tokens,
         )
         # KVarN precision tail: the tail region is never published, and its
-        # block-aligned boundary crossings emit demotion ranges for the
-        # worker (fp8 -> kvarn re-quantization of the exiting records).
+        # boundary crossings emit demotion ranges for the worker (fp8 ->
+        # kvarn re-quantization of the exiting records). EXTENDS (prefill
+        # chunks) demote the WHOLE tail and reset ts to S: the ckv gather
+        # then always reads uniform kvarn records, and prompt tokens are
+        # fully publishable. Decode allocations grow the tail normally.
         if self.kvarn_tail_tokens:
             req_id = request.request_id
-            if req_id not in self._kvarn_tail_hit_len:
-                # H = tokens the request did not store itself (first call).
-                self._kvarn_tail_hit_len[req_id] = min(
-                    total_computed_tokens, num_tokens_to_cache
-                )
-            hit_len = self._kvarn_tail_hit_len[req_id]
             block_size = self.coordinator.single_type_managers[0].block_size
-            ts_new = max(
-                -(-max(num_tokens_to_cache - self.kvarn_tail_tokens, 0) // block_size)
-                * block_size,
-                hit_len,
+            ts_old = self._kvarn_tail_start.get(req_id, 0)
+            is_extend = num_tokens_to_cache > ts_old and (
+                request.num_computed_tokens + num_new_tokens
+                <= request.num_prompt_tokens
             )
-            ts_old = self._kvarn_tail_start.get(req_id, hit_len)
-            if ts_new > ts_old:
-                self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
+            if is_extend:
+                if ts_old < num_tokens_to_cache:
+                    # everything above ts_old is decode-phase fp8
+                    self._kvarn_tail_demotions.append(
+                        (req_id, ts_old, num_tokens_to_cache)
+                    )
+                ts_new = num_tokens_to_cache
+            else:
+                ts_new = max(
+                    -(-max(num_tokens_to_cache - self.kvarn_tail_tokens, 0) // block_size)
+                    * block_size,
+                    ts_old,
+                )
+                if ts_new > ts_old:
+                    self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
             self._kvarn_tail_start[req_id] = ts_new
             num_tokens_to_cache = min(num_tokens_to_cache, ts_new)
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
@@ -836,7 +846,6 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self._kvarn_tail_hit_len.pop(request.request_id, None)
         self._kvarn_tail_start.pop(request.request_id, None)
         boundary_blocks = self._pop_boundary_blocks(request)
         self.block_pool.free_blocks(boundary_blocks)

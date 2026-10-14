@@ -21,46 +21,42 @@ import triton.language as tl
 from vllm.v1.attention.ops.kvarn_demote import _kvarn_pack_codes
 
 
-def kvarn_tail_classify(
-    cache_seq_lens_per_token: torch.Tensor,
+def kvarn_tail_boundary(
+    tail_start: torch.Tensor,
     req_id_per_token: torch.Tensor,
-    num_reqs: int,
-    n_local: int,
-    hit_len: torch.Tensor | None,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Classify batch tokens into fp8-tail vs kvarn-body stores.
+) -> torch.Tensor:
+    """Per-token tail boundary: the request's manager-owned ``ts``.
 
-    Returns ``(is_tail, boundary, s_per_token)`` where ``is_tail[i]`` is 1
-    when token ``i`` lands inside its request's tail window (store fp8) and
-    0 when it must be written directly as a kvarn record. The boundary is
-    BLOCK-ALIGNED and clamped at the request's hit length H:
-    ``boundary = max(align_up(S - N, block_size), H)`` — published (shared)
-    blocks always sit below the boundary and therefore always read as
-    kvarn records, whatever request reads them.
+    The fp8 region is exactly ``[ts, S)`` (DCP-local positions); the
+    manager owns ``ts`` and guarantees every published block sits below
+    it, so a position's record format is ``fp8 iff pos >= ts``.
     """
-    num_tokens = cache_seq_lens_per_token.shape[0]
-    device = cache_seq_lens_per_token.device
-    # S_r per request: segment max of csl by req_id (scatter-reduce amax),
-    # then gather back per token. Pure torch ops, capture-safe.
-    s_per_req = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-    s_per_req.scatter_reduce_(
-        0,
-        req_id_per_token.to(torch.int64),
-        cache_seq_lens_per_token,
-        reduce="amax",
-    )
-    s_per_token = s_per_req[req_id_per_token.to(torch.int64)]
-    # Block-aligned raw boundary: ceil((S-N)/bs)*bs, clamped at 0.
-    raw = (s_per_token - n_local).clamp_min_(0)
-    aligned = ((raw + block_size - 1) // block_size) * block_size
-    if hit_len is not None:
-        h_per_token = hit_len.to(torch.int32)[req_id_per_token.to(torch.int64)]
-        boundary = torch.maximum(aligned, h_per_token)
-    else:
-        boundary = aligned
-    is_tail = (cache_seq_lens_per_token - 1) >= boundary
-    return is_tail.to(torch.int32), boundary, s_per_token
+    return tail_start.to(torch.int32)[req_id_per_token.to(torch.int64)]
+
+
+def kvarn_tail_global_boundary(
+    tail_start: torch.Tensor,
+    req_id_per_token: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+    interleave: int,
+) -> torch.Tensor:
+    """The tail boundary in GLOBAL request-relative positions.
+
+    The indexer's top-k candidates are global request-relative positions;
+    a candidate is tail iff its DCP-local index >= ts. Local index j owns
+    global positions ``g`` with ``(g // i) % ws == rank`` and local index
+    ``(g // i) // ws * i + g % i``. Inverting at the boundary (ts is
+    block-aligned, hence a multiple of i for i in (1, 2, 4)):
+
+        g_ts = (ts // i) * ws * i + rank * i + ts % i
+    """
+    i = max(1, int(interleave))
+    ws = max(1, int(dcp_world_size))
+    ts = tail_start.to(torch.int64)
+    return (
+        (ts // i) * ws * i + int(dcp_rank) * i + ts % i
+    ).to(torch.int32)[req_id_per_token.to(torch.int64)]
 
 
 def kvarn_tail_positions_to_slots(
