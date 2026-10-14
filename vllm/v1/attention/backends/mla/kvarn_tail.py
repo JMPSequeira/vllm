@@ -236,6 +236,7 @@ def merge_tail_lse(
     lse_tail: torch.Tensor,
     out_body: torch.Tensor,
     lse_body: torch.Tensor,
+    chunk_rows: int = 512,
 ) -> torch.Tensor:
     """Re-merge two partial attentions via natural-log LSE.
 
@@ -243,18 +244,30 @@ def merge_tail_lse(
     ``lse = log(denom)`` (lse_scale="natural"). The combined attention is
     ``(sum_tail + sum_body) / (denom_tail + denom_body)``. Rows whose LSE
     is -inf (empty segment) contribute nothing.
+
+    Processed in row chunks: at extend scale (4096 rows x 16 heads x 512)
+    a full fp32 materialization is ~1 GB of temporaries against a pool
+    budget that leaves only a few hundred MB free — chunking caps the
+    peak at ~80 MB. ``chunk_rows`` is host-static, so the loop is
+    capture-safe.
     """
-    a = lse_tail.float()
-    b = lse_body.float()
-    m = torch.maximum(a, b)
-    # exp(lse - m) with -inf handling: where m == -inf both weights are 0.
-    wa = torch.exp(a - m)
-    wb = torch.exp(b - m)
-    denom = wa + wb
-    safe = denom > 0
-    # An empty segment (all candidates masked) has lse = -inf and a
-    # garbage/NaN normalized output; zero it so 0-weight rows stay clean.
-    at = torch.where((a > float("-inf"))[..., None], out_tail.float(), 0.0)
-    bt = torch.where((b > float("-inf"))[..., None], out_body.float(), 0.0)
-    out = (at * wa[..., None] + bt * wb[..., None]) / (denom[..., None])
-    return torch.where(safe[..., None], out, at).to(out_tail.dtype)
+    rows = out_tail.shape[0]
+    out = torch.empty_like(out_tail)
+    for s in range(0, rows, chunk_rows):
+        e = min(s + chunk_rows, rows)
+        a = lse_tail[s:e].float()
+        b = lse_body[s:e].float()
+        m = torch.maximum(a, b)
+        # exp(lse - m) with -inf handling: where m == -inf both weights 0.
+        wa = torch.exp(a - m)
+        wb = torch.exp(b - m)
+        denom = wa + wb
+        safe = denom > 0
+        # An empty segment (all candidates masked) has lse = -inf and a
+        # garbage/NaN normalized output; zero it so 0-weight rows stay
+        # clean instead of propagating NaN (NaN * 0).
+        at = torch.where((a > float("-inf"))[..., None], out_tail[s:e].float(), 0.0)
+        bt = torch.where((b > float("-inf"))[..., None], out_body[s:e].float(), 0.0)
+        o = (at * wa[..., None] + bt * wb[..., None]) / denom[..., None]
+        out[s:e] = torch.where(safe[..., None], o, at).to(out_tail.dtype)
+    return out
