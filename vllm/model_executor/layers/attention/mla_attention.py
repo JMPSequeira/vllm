@@ -995,6 +995,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             slot_mapping,
             kv_cache_dtype,
             k_scale,
+            attn_metadata=attn_metadata,
         )
         if cache is not None:
             mirror_target = cache.mirror_write_target(kv_c_normed.shape[0])
@@ -1007,6 +1008,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mirror_slots,
                     kv_cache_dtype,
                     k_scale,
+                    attn_metadata=attn_metadata,
                 )
 
     def prepare_kv_cache_update(

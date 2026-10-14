@@ -1339,6 +1339,33 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             self._concat_and_cache_glm_next_mla_kvarn = (
                 module.concat_and_cache_glm_next_mla_kvarn
             )
+            # Precision tail (design doc §10): newest N tokens hold fp8
+            # records inside the kvarn pool; 0 disables the feature and
+            # reproduces the stock per-token kvarn store byte-for-byte.
+            self._kvarn_tail_local_tokens = 0
+            self._cache_writer_tail_plan = None
+            self._concat_and_cache_glm_next_mla_fp8_tail = None
+            tail_tokens = int(
+                getattr(vllm_config.cache_config, "kvarn_tail_tokens", 0) or 0
+            )
+            if tail_tokens:
+                dcp_size = max(
+                    1, int(vllm_config.parallel_config.decode_context_parallel_size)
+                )
+                if tail_tokens % 256:
+                    raise ValueError(
+                        "--kvarn-tail-tokens must be a multiple of the 256-token "
+                        f"tile group; got {tail_tokens}"
+                    )
+                if tail_tokens % dcp_size:
+                    raise ValueError(
+                        f"--kvarn-tail-tokens ({tail_tokens}) must be divisible "
+                        f"by the DCP world size ({dcp_size})"
+                    )
+                self._kvarn_tail_local_tokens = tail_tokens // dcp_size
+                self._concat_and_cache_glm_next_mla_fp8_tail = (
+                    module.concat_and_cache_glm_next_mla_fp8_tail
+                )
         elif self._is_glm_next:
             self._model_type = int(module.ModelType.GLM_NEXT)
             self._concat_and_cache_glm_next_mla = (
@@ -1663,7 +1690,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 kv_probe, self._bound_kv_cache, ignored_slots
             )
             self._cache_writer_plan = writer_plan
-
             def prepare_writer(state):
                 probe = torch.empty(
                     (self._max_tokens, self.kv_lora_rank),
@@ -1700,6 +1726,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     dependencies=tuple(request.name for request in requests),
                 )
             )
+            if self._kvarn_tail_local_tokens:
+                tail_writer_plan = self._module.plan_cache_writer_fp8_tail(
+                    kv_probe, self._bound_kv_cache, ignored_slots
+                )
+                self._cache_writer_tail_plan = tail_writer_plan
+                requests.append(
+                    tail_writer_plan.request(
+                        name=f"{self._preparation_prefix()}.cache_writer_fp8_tail",
+                        prepare_call=prepare_writer,
+                        benchmark_call=prepare_writer,
+                        dependencies=tuple(request.name for request in requests),
+                    )
+                )
         provider = getattr(self, "_physical_selection_provider", None)
         selection_request = getattr(
             provider, "get_b12x_physical_selection_preparation_request", None
@@ -2055,6 +2094,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
+        attn_metadata=None,
     ) -> None:
         if self._uses_kvarn_cache:
             if kv_cache.numel() == 0:
@@ -2064,13 +2104,56 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 raise PreparationResourceUnavailableError(
                     f"{self._preparation_prefix()} has no declared cache_writer plan"
                 )
-            # kv_c_normed is already Hadamard-rotated (MLA wrapper). The
-            # per-token record scheme stores each token directly at its slot
-            # (inline scale/zp) -- no shadow pool, no whole-page re-quant, no
-            # host syncs; capture-safe at any batch size.
-            self._concat_and_cache_glm_next_mla_kvarn(
-                kv_c_normed, kv_cache, slot_mapping.flatten(), plan=plan
+            slots = slot_mapping.flatten()
+            tail_plan = self._cache_writer_tail_plan
+            if (
+                tail_plan is None
+                or attn_metadata is None
+                or attn_metadata.cache_seq_lens_per_token is None
+            ):
+                # kv_c_normed is already Hadamard-rotated (MLA wrapper). The
+                # per-token record scheme stores each token directly at its
+                # slot (inline scale/zp) -- no shadow pool, no whole-page
+                # re-quant, no host syncs; capture-safe at any batch size.
+                self._concat_and_cache_glm_next_mla_kvarn(
+                    kv_c_normed, kv_cache, slots, plan=plan
+                )
+                return
+            # Precision tail: newest N tokens store fp8_ds_mla records
+            # inside the 536B slots; older tokens store kvarn records; the
+            # token crossing out of the window is re-quantized in place.
+            # Dispatch is shape-static: both writers see the full batch
+            # with non-mine slots masked to -1 (writers skip slot < 0).
+            from vllm.v1.attention.backends.mla.kvarn_tail import (
+                kvarn_tail_classify,
+                kvarn_tail_demote_slots,
             )
+
+            num_tokens = slots.shape[0]
+            csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
+            req_ids = attn_metadata.req_id_per_token[:num_tokens]
+            n_local = self._kvarn_tail_local_tokens
+            is_tail, boundary, _ = kvarn_tail_classify(
+                csl, req_ids, attn_metadata.num_reqs, n_local
+            )
+            tail_slots = torch.where(is_tail.bool(), slots, slots.new_full((), -1))
+            body_slots = torch.where(is_tail.bool(), slots.new_full((), -1), slots)
+            self._module.concat_and_cache_glm_next_mla_fp8_tail(
+                kv_c_normed, kv_cache, tail_slots, plan=tail_plan
+            )
+            self._concat_and_cache_glm_next_mla_kvarn(
+                kv_c_normed, kv_cache, body_slots, plan=plan
+            )
+            demote_slots = kvarn_tail_demote_slots(
+                csl,
+                req_ids,
+                boundary,
+                attn_metadata.block_table,
+                attn_metadata.block_size,
+            )
+            from vllm.v1.attention.ops.kvarn_demote import demote_fp8_records
+
+            demote_fp8_records(kv_cache, demote_slots, self._kvarn_layout)
             return
         if self._uses_glm_dsa_nvfp4_cache:
             if kv_cache.numel() == 0:
