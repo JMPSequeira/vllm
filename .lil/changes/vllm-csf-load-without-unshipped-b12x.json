@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-csf-load-without-unshipped-b12x",
+  "category": "fix",
+  "summary": "FP4-CSF checkpoints load again in the canonical image instead of failing with No module named 'b12x.loader._csf_source'",
+  "models": [
+    "GLM-5.3-Flash",
+    "GLM-5.3",
+    "DeepSeek-V4.1-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. Canonical images karmic-kraken-20261012 and karmic-kraken-20261013 cannot load CSF checkpoints; this image loads them as karmic-kraken-20261011 did.",
+  "details": [
+    "Canonical vLLM commits 84c0704f8f and 3a947437cf moved CSF scale loading to b12x.loader._csf_source and b12x.loader._csf_blocks. The FlashInfer build in the image does not ship those modules, so every CSF checkpoint failed at load with ModuleNotFoundError.",
+    "Both commits are reverted, so the CSF loader is again the one from karmic-kraken-20261011. The block CSF format can return together with a FlashInfer build that ships those modules."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    1023
+  ],
+  "requires": []
+}
