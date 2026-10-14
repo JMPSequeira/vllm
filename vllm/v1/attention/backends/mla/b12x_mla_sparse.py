@@ -1909,6 +1909,21 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             return
         self._set_kernel_page_size(kernel_page_size)
         self._kernel_page_size_finalized = True
+        # Pre-reserve the full-CKV gather workspace NOW: the workspace
+        # locks after warmup, and the warmup/profile batches do not
+        # reliably engage the ckv_extend route -- a first real gather
+        # after the lock would then fail on arena growth. Reserving here
+        # (pre-lock, geometry final) sizes the arena for the largest
+        # simultaneous set; smaller decode sets reuse it.
+        if self._ckv_gather_enabled:
+            from vllm.v1.worker.workspace import current_workspace_manager
+
+            current_workspace_manager().get_simultaneous(
+                *self._workspace_specs(
+                    input_num_heads=self._kernel_num_heads,
+                    include_ckv=True,
+                )
+            )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if self._uses_kvarn_cache:
@@ -2137,7 +2152,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if use_ckv_gather:
             logger.info_once("Using full-CKV gather for B12X DCP prefill")
         input_num_heads = self.num_heads if use_ckv_gather else self._input_num_heads
-        kernel_num_heads = _round_up_heads(input_num_heads)
+        # Plans and scratch are declared at the DCP-global padded head width;
+        # the gather route binds the same 64-head scratch with its 32 real
+        # heads zero-padded (the MG kernel drops the pad, like TP6 padding).
+        kernel_num_heads = self._kernel_num_heads
         workspace_specs = self._workspace_specs(
             input_num_heads=kernel_num_heads,
             include_ckv=use_ckv_gather,
