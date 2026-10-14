@@ -69,37 +69,36 @@ def kvarn_tail_positions_to_slots(
 
 @triton.jit
 def _kvarn_tail_demote_slots_kernel(
-    boundary_ptr,  # int32 [num_tokens]: S_r - N_local per token
+    csl_ptr,  # int32 [num_tokens]: context len (pos + 1), DCP-local
     req_id_ptr,  # int32 [num_tokens]
     block_table_ptr,  # int32 [num_reqs, max_blocks]
     slots_ptr,  # int32 [num_tokens] out: demote slot per token (-1 none)
     num_tokens,
     max_blocks,
+    N_LOCAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One demotion candidate per token: position ``boundary - T_r``.
+    """Demotion slot per token: the record at ``pos_i - N_local``.
 
-    For request ``r`` with ``T_r`` new tokens, the fp8 records leaving the
-    window sit at positions ``[S_new - N - T_r, S_new - N)``. Decode batches
-    have ``T_r`` tokens of request ``r`` in this batch, so the per-token
-    slot of the OLDEST fp8 record that must flip is
-    ``boundary_r - (number of tokens of r after i in this batch)``. This
-    kernel handles the common T_r == 1 (pure decode) case; multi-token
-    requests must call :func:`kvarn_tail_demote_range` instead.
+    The tail boundary advances by exactly the number of new tokens, so the
+    fp8 record leaving the window for batch token ``i`` sits at position
+    ``pos_i - N_local`` — a 1:1 shift holding for decode (T=1) and extend
+    chunks (T>1) alike, and always landing inside the OLD fp8 window
+    (``pos_i - N >= S_old - N`` because ``pos_i >= S_old``). Slots below
+    position 0 (context shorter than the tail) are skipped. Capture-safe:
+    fixed shapes, no host syncs.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     m = offs < num_tokens
-    boundary = tl.load(boundary_ptr + offs, mask=m, other=0)
+    csl = tl.load(csl_ptr + offs, mask=m, other=1)
     req = tl.load(req_id_ptr + offs, mask=m, other=0).to(tl.int64)
-    # This token's own position; the demoted position is boundary - 1 for
-    # T_r == 1 requests (the token itself is the only newcomer).
-    demote_pos = boundary - 1
+    pos = csl - 1
+    demote_pos = pos - N_LOCAL
     valid = m & (demote_pos >= 0)
-    bt_row = req * max_blocks
     blk = tl.load(
-        block_table_ptr + bt_row + demote_pos.to(tl.int64) // BLOCK_SIZE,
+        block_table_ptr + req * max_blocks + demote_pos.to(tl.int64) // BLOCK_SIZE,
         mask=valid,
         other=0,
     )
@@ -110,79 +109,34 @@ def _kvarn_tail_demote_slots_kernel(
 def kvarn_tail_demote_slots(
     cache_seq_lens_per_token: torch.Tensor,
     req_id_per_token: torch.Tensor,
-    boundary: torch.Tensor,
+    n_local: int,
     block_table: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
     """Slots of fp8 records that must be re-quantized to kvarn this step.
 
-    Returns an int32 tensor of shape ``[num_tokens]`` with one candidate
-    slot per token (``-1`` = nothing to demote). Valid for pure-decode
-    batches (one new token per request); extend batches pass the full
-    demotion range through :func:`kvarn_tail_demote_positions`.
+    One candidate slot per batch token (``-1`` = nothing to demote): the
+    record at ``pos_i - N_local``. Unified for decode and extend chunks;
+    see :func:`_kvarn_tail_demote_slots_kernel` for the proof of the
+    1:1 shift. Capture-safe.
     """
     num_tokens = cache_seq_lens_per_token.shape[0]
-    slots = torch.empty(num_tokens, dtype=torch.int32, device=boundary.device)
+    slots = torch.empty(
+        num_tokens, dtype=torch.int32, device=cache_seq_lens_per_token.device
+    )
     grid = (triton.cdiv(num_tokens, 256),)
     _kvarn_tail_demote_slots_kernel[grid](
-        boundary,
+        cache_seq_lens_per_token,
         req_id_per_token,
         block_table,
         slots,
         num_tokens,
         block_table.shape[1],
+        N_LOCAL=n_local,
         BLOCK_SIZE=block_size,
         BLOCK=256,
     )
     return slots
-
-
-def kvarn_tail_demote_positions(
-    boundary: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    req_id_per_token: torch.Tensor,
-    block_table: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """All demotion positions for a batch (extend-safe), compacted.
-
-    Per request ``r``: positions ``[max(boundary_r - T_r, 0), boundary_r)``
-    where ``T_r`` is the request's query length. Returns a compact int32
-    tensor of physical slots (length = total demotions across requests).
-    """
-    device = boundary.device
-    num_reqs = query_start_loc.shape[0] - 1
-    qsl = query_start_loc.to(torch.int64)
-    query_lens = qsl[1:] - qsl[:-1]  # T_r per request
-    s_per_req = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-    s_per_req.scatter_reduce_(
-        0,
-        req_id_per_token.to(torch.int64),
-        boundary + 0,  # boundary is per token; amax recovers per-request value
-        reduce="amax",
-    )
-    # Per-request demotion ranges [lo_r, hi_r), lo = max(bnd - T, 0).
-    hi = s_per_req.clamp_min(0)
-    lo = (hi - query_lens).clamp_min(0)
-    counts = hi - lo  # >= 0
-    total = int(counts.sum().item())  # host sync: extend path only (not captured)
-    if total == 0:
-        return torch.empty(0, dtype=torch.int32, device=device)
-    # Compact: positions per request via a small torch expansion.
-    max_count = int(counts.max().item())
-    req_idx = torch.arange(num_reqs, device=device)
-    offsets = torch.arange(max_count, device=device)
-    pos = lo[:, None] + offsets[None, :]
-    valid = offsets[None, :] < counts[:, None]
-    pos = torch.where(valid, pos, torch.zeros_like(pos))
-    slots = kvarn_tail_positions_to_slots(
-        pos.reshape(-1),
-        req_idx.repeat_interleave(max_count),
-        block_table,
-        block_size,
-    )
-    slots = slots.reshape(num_reqs, max_count)[valid]
-    return slots.to(torch.int32)
 
 
 def merge_tail_lse(

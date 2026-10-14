@@ -2147,7 +2147,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             demote_slots = kvarn_tail_demote_slots(
                 csl,
                 req_ids,
-                boundary,
+                n_local,
                 attn_metadata.block_table,
                 attn_metadata.block_size,
             )

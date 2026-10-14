@@ -13,7 +13,6 @@ import torch
 
 from vllm.v1.attention.backends.mla.kvarn_tail import (
     kvarn_tail_classify,
-    kvarn_tail_demote_positions,
     kvarn_tail_demote_slots,
     merge_tail_lse,
 )
@@ -53,46 +52,34 @@ def test_demote_slots_decode():
     # S_new=101, N=50, T=1: position 50 flips fp8->kvarn; slot via page 7.
     csl = torch.tensor([101, 31, 1], dtype=torch.int32, device="cuda")
     req = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    _, boundary, _ = kvarn_tail_classify(csl, req, 3, 50)
     bt = _page(7)
-    slots = kvarn_tail_demote_slots(csl, req, boundary, bt, BLOCK)
+    slots = kvarn_tail_demote_slots(csl, req, 50, bt, BLOCK)
     assert slots[0].item() == 7 * BLOCK + 50
-    # boundary 0 -> nothing below the window to demote.
+    # pos 30 - 50 < 0 and pos 0 - 50 < 0: nothing below the window.
     assert slots[1].item() == -1
     assert slots[2].item() == -1
 
 
-def test_demote_positions_extend():
-    # Request with T=4 new tokens, boundary 51: positions [47, 51) flip.
-    bnd = torch.tensor([51, 51, 51, 51], dtype=torch.int32, device="cuda")
-    rid = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
-    qsl = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+def test_demote_slots_extend_chunk():
+    # Chunk of 4 tokens at positions 100..103, N=50: demotes 50..53.
+    csl = torch.tensor([101, 102, 103, 104], dtype=torch.int32, device="cuda")
+    req = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
     bt = _page(7)
-    pos = kvarn_tail_demote_positions(bnd, qsl, rid, bt, BLOCK)
-    assert pos.tolist() == [7 * BLOCK + p for p in (47, 48, 49, 50)]
-
-
-def test_demote_positions_clamped_short_context():
-    # S=31, N=50 -> boundary 0; no demotion regardless of T.
-    bnd = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
-    rid = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
-    qsl = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
-    bt = _page(7)
-    pos = kvarn_tail_demote_positions(bnd, qsl, rid, bt, BLOCK)
-    assert pos.numel() == 0
+    slots = kvarn_tail_demote_slots(csl, req, 50, bt, BLOCK)
+    assert slots.tolist() == [7 * BLOCK + p for p in (50, 51, 52, 53)]
 
 
 def test_demote_positions_multiple_requests():
-    # Req 0: T=2, boundary 51 -> [49, 51). Req 1: T=1, boundary 10 -> [9, 10).
-    bnd = torch.tensor([51, 51, 10], dtype=torch.int32, device="cuda")
-    rid = torch.tensor([0, 0, 1], dtype=torch.int32, device="cuda")
-    qsl = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+    # Req 0: two tokens (pos 200, 201), N=50 -> demote 150, 151.
+    # Req 1: one token (pos 20), N=50 -> none.
+    csl = torch.tensor([201, 202, 21], dtype=torch.int32, device="cuda")
+    req = torch.tensor([0, 0, 1], dtype=torch.int32, device="cuda")
     bt = _page(3)
-    pos = kvarn_tail_demote_positions(bnd, qsl, rid, bt, BLOCK)
-    assert pos.tolist() == [
-        3 * BLOCK + 49,
-        3 * BLOCK + 50,
-        13 * BLOCK + 9,
+    slots = kvarn_tail_demote_slots(csl, req, 50, bt, BLOCK)
+    assert slots.tolist() == [
+        3 * BLOCK + 150,
+        3 * BLOCK + 151,
+        -1,
     ]
 
 
