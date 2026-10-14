@@ -182,6 +182,12 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    kvarn_tail_tokens: int = Field(default=0, ge=0)
+    """Number of newest tokens kept in a high-fidelity fp8_ds_mla-format tail
+    at the end of the KV cache while the older body stays kvarn-quantized
+    (kvarn_mla_* cache dtypes only). 0 disables the tail (default); launch
+    targets are 1024/2048/4096. Must be a multiple of the 256-token kvarn
+    tile group and of the DCP world size."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
