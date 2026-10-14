@@ -2517,6 +2517,31 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
+        # KVarN precision tail: per-request hit lengths + demotion ranges
+        # (host-built each step; empty when the tail is disabled).
+        kvarn_tail_hit_len = None
+        kvarn_tail_demote_ranges = None
+        kvarn_tail_hit_lens = getattr(self, "_kvarn_tail_hit_lens_step", None) or {}
+        if kvarn_tail_hit_lens:
+            kvarn_tail_hit_len = torch.zeros(
+                num_reqs_padded, dtype=torch.int32, device=self.device
+            )
+            kvarn_tail_demote_ranges = torch.zeros(
+                num_reqs_padded, 2, dtype=torch.int32, device=self.device
+            )
+            req_index = self.input_batch.req_id_to_index
+            for req_id, hit in kvarn_tail_hit_lens.items():
+                idx = req_index.get(req_id)
+                if idx is not None and idx < num_reqs_padded:
+                    kvarn_tail_hit_len[idx] = hit
+            for req_id, (lo, hi) in (
+                getattr(self, "_kvarn_tail_demotions_step", None) or {}
+            ).items():
+                idx = req_index.get(req_id)
+                if idx is not None and idx < num_reqs_padded:
+                    kvarn_tail_demote_ranges[idx, 0] = lo
+                    kvarn_tail_demote_ranges[idx, 1] = hi
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2534,6 +2559,8 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            kvarn_tail_hit_len=kvarn_tail_hit_len,
+            kvarn_tail_demote_ranges=kvarn_tail_demote_ranges,
         )
 
         if self.dcp_world_size > 1:
@@ -4385,6 +4412,11 @@ class GPUModelRunner(
                 ubatch_slices,
                 ubatch_slices_padded,
             )
+
+            # KVarN precision tail: per-step scheduler state consumed by the
+            # common-metadata build below.
+            self._kvarn_tail_hit_lens_step = scheduler_output.kvarn_tail_hit_lens
+            self._kvarn_tail_demotions_step = scheduler_output.kvarn_tail_demotions
 
             # True if any attention backend handles KV cache update separately
             # from forward() (i.e., forward_includes_kv_cache_update=False). When true,

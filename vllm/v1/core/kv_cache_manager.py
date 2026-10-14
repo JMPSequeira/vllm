@@ -185,8 +185,18 @@ class KVCacheManager:
         enable_mamba_fine_grained_prefix_cache: bool = False,
         enable_boundary_checkpoints: bool = False,
         num_lookahead_tokens: int = 0,
+        kvarn_tail_tokens: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
+        # KVarN precision tail (lil/kvarn-mla-design.md §10): newest N tokens
+        # of each request hold fp8 records and are NEVER published to the
+        # prefix cache, so published blocks are uniformly kvarn and demotion
+        # writes stay on request-private blocks. 0 disables the feature and
+        # reproduces the stock caching behavior exactly.
+        self.kvarn_tail_tokens = int(kvarn_tail_tokens)
+        self._kvarn_tail_hit_len: dict[str, int] = {}
+        self._kvarn_tail_start: dict[str, int] = {}
+        self._kvarn_tail_demotions: list[tuple[str, int, int]] = []
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -781,9 +791,42 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
+        # KVarN precision tail: the tail region is never published, and its
+        # block-aligned boundary crossings emit demotion ranges for the
+        # worker (fp8 -> kvarn re-quantization of the exiting records).
+        if self.kvarn_tail_tokens:
+            req_id = request.request_id
+            if req_id not in self._kvarn_tail_hit_len:
+                # H = tokens the request did not store itself (first call).
+                self._kvarn_tail_hit_len[req_id] = min(
+                    total_computed_tokens, num_tokens_to_cache
+                )
+            hit_len = self._kvarn_tail_hit_len[req_id]
+            block_size = self.coordinator.single_type_managers[0].block_size
+            ts_new = max(
+                -(-max(num_tokens_to_cache - self.kvarn_tail_tokens, 0) // block_size)
+                * block_size,
+                hit_len,
+            )
+            ts_old = self._kvarn_tail_start.get(req_id, hit_len)
+            if ts_new > ts_old:
+                self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
+            self._kvarn_tail_start[req_id] = ts_new
+            num_tokens_to_cache = min(num_tokens_to_cache, ts_new)
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def take_kvarn_tail_demotions(self) -> dict[str, tuple[int, int]]:
+        """Drain this step's fp8->kvarn demotion ranges (request_id -> (lo, hi))."""
+        if not self._kvarn_tail_demotions:
+            return {}
+        demotions = {}
+        for req_id, lo, hi in self._kvarn_tail_demotions:
+            prev = demotions.get(req_id, (lo, lo))
+            demotions[req_id] = (min(prev[0], lo), max(prev[1], hi))
+        self._kvarn_tail_demotions.clear()
+        return demotions
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -793,6 +836,8 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._kvarn_tail_hit_len.pop(request.request_id, None)
+        self._kvarn_tail_start.pop(request.request_id, None)
         boundary_blocks = self._pop_boundary_blocks(request)
         self.block_pool.free_blocks(boundary_blocks)
         self.coordinator.free(request.request_id)

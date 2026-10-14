@@ -1,11 +1,10 @@
-"""KVarN precision-tail helper tests: boundary math and LSE merge.
+"""KVarN precision-tail helper tests: boundary math + range demotion + merge.
 
-The tail window is the newest N tokens of each request (DCP-local
-positions); the format boundary and demotion ranges are pure tensor math
-with real edge cases (S < N clamping, multi-token batches, empty
-demotions). Demotion slots must hit exactly the positions
-``[S_new - N - T_r, S_new - N)`` — off-by-one here silently quantizes the
-wrong token and corrupts verbatim recall.
+The tail boundary is block-aligned and clamped at the request's hit length
+H so published (shared) blocks always read as kvarn records regardless of
+which request reads them. Demotion consumes per-request [lo, hi) ranges
+emitted by the KV cache manager at block crossings — an off-by-one there
+silently quantizes the wrong token and corrupts verbatim recall.
 """
 
 import pytest
@@ -13,74 +12,100 @@ import torch
 
 from vllm.v1.attention.backends.mla.kvarn_tail import (
     kvarn_tail_classify,
-    kvarn_tail_demote_slots,
+    kvarn_tail_demote_ranges,
     merge_tail_lse,
 )
+from vllm.v1.attention.ops.kvarn_demote import demote_fp8_records
+from vllm.v1.attention.ops.kvarn_mla import (
+    KvarnMlaLayout,
+    pack_kvarn_mla_records,
+    unpack_kvarn_mla_records,
+)
 
-BLOCK = 256
-
-
-def _page(page: int) -> torch.Tensor:
-    bt = torch.zeros(4, 8, dtype=torch.int32, device="cuda")
-    bt[:, :] = -1
-    for r in range(4):
-        bt[r] = torch.arange(page + r * 10, page + r * 10 + 8)
-    return bt
+BLOCK = 16  # small block size for clean boundary math
 
 
-def test_classify_decode_batch():
-    # 3 requests, one token each; pre-update lens 100, 30, 0 -> pos 100, 30, -.
-    csl = torch.tensor([101, 31, 1], dtype=torch.int32, device="cuda")
-    req = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    is_tail, boundary, s_tok = kvarn_tail_classify(csl, req, 3, 50)
-    assert boundary.tolist() == [51, 0, 0]
-    assert s_tok.tolist() == [101, 31, 1]
-    # pos 100 >= 51: tail; pos 30 and 0 >= 0 (whole short context is tail).
-    assert is_tail.tolist() == [1, 1, 1]
+def _layout() -> KvarnMlaLayout:
+    return KvarnMlaLayout(k_bits=4, v_bits=4, group=256)
 
 
-def test_classify_body_token():
-    # Request 0 has two new tokens: pos 200 (tail) and pos 40 (body).
-    csl = torch.tensor([201, 41], dtype=torch.int32, device="cuda")
+def test_classify_block_aligned_boundary():
+    # S=101, N=50, bs=16: raw = 51 -> aligned = 64. Position 100 (csl 101)
+    # is tail; a body token at pos 63 (csl 64) sits below the boundary.
+    csl = torch.tensor([101, 64], dtype=torch.int32, device="cuda")
     req = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
-    is_tail, boundary, _ = kvarn_tail_classify(csl, req, 1, 50)
-    assert boundary.tolist() == [151, 151]
+    is_tail, boundary, s_tok = kvarn_tail_classify(csl, req, 1, 50, None, BLOCK)
+    assert boundary.tolist() == [64, 64]
+    assert s_tok.tolist() == [101, 101]
     assert is_tail.tolist() == [1, 0]
 
 
-def test_demote_slots_decode():
-    # S_new=101, N=50, T=1: position 50 flips fp8->kvarn; slot via page 7.
-    csl = torch.tensor([101, 31, 1], dtype=torch.int32, device="cuda")
-    req = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
-    bt = _page(7)
-    slots = kvarn_tail_demote_slots(csl, req, 50, bt, BLOCK)
-    assert slots[0].item() == 7 * BLOCK + 50
-    # pos 30 - 50 < 0 and pos 0 - 50 < 0: nothing below the window.
-    assert slots[1].item() == -1
-    assert slots[2].item() == -1
+def test_classify_hit_clamp():
+    # Hit request: H=200 covers S=201 entirely; the boundary must never dip
+    # into the published (kvarn) prefix even when S-N < H.
+    csl = torch.tensor([201, 221], dtype=torch.int32, device="cuda")
+    req = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+    hit = torch.tensor([200], dtype=torch.int32, device="cuda")
+    is_tail, boundary, _ = kvarn_tail_classify(csl, req, 1, 50, hit, BLOCK)
+    # raw = align_up(201-50)=160 -> max(160, 200) = 200; pos 200 tail.
+    assert boundary.tolist() == [200, 200]
+    assert is_tail.tolist() == [1, 1]
 
 
-def test_demote_slots_extend_chunk():
-    # Chunk of 4 tokens at positions 100..103, N=50: demotes 50..53.
-    csl = torch.tensor([101, 102, 103, 104], dtype=torch.int32, device="cuda")
-    req = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
-    bt = _page(7)
-    slots = kvarn_tail_demote_slots(csl, req, 50, bt, BLOCK)
-    assert slots.tolist() == [7 * BLOCK + p for p in (50, 51, 52, 53)]
+def test_demote_ranges_matches_slot_list():
+    """Range-driven demotion must equal per-slot demotion bit-for-bit."""
+    layout = _layout()
+    torch.manual_seed(3)
+    T = 512
+    latent = torch.randn(T, 512, device="cuda", dtype=torch.bfloat16)
+    fp8 = _make_fp8_record(latent)
+    page_size = 256
+    pages = (T + page_size - 1) // page_size
+    bt = torch.arange(pages, dtype=torch.int32, device="cuda").view(1, -1)
+    pool = torch.zeros(pages, page_size, layout.record_bytes,
+                       dtype=torch.uint8, device="cuda")
+    pool.reshape(-1, layout.record_bytes)[:T, :528] = fp8
+    # contiguous pages => slot == position
+    ranges = torch.tensor([[100, 356], [0, 0]], dtype=torch.int32, device="cuda")
+    kvarn_tail_demote_ranges(pool, ranges, bt, page_size, layout, T)
+    demoted = pool.reshape(-1, layout.record_bytes)
+    # reference: explicit slot list over the same positions
+    ref_pool = torch.zeros(pages, page_size, layout.record_bytes,
+                           dtype=torch.uint8, device="cuda")
+    ref_pool.reshape(-1, layout.record_bytes)[:T, :528] = fp8
+    slots = torch.arange(100, 356, device="cuda", dtype=torch.int64)
+    demote_fp8_records(ref_pool, slots, layout)
+    ref = ref_pool.reshape(-1, layout.record_bytes)
+    assert torch.equal(demoted, ref)
+    # untouched slots keep their fp8 content
+    assert torch.equal(demoted[:100, :528], fp8[:100])
+    assert torch.equal(demoted[356:T, :528], fp8[356:T])
 
 
-def test_demote_positions_multiple_requests():
-    # Req 0: two tokens (pos 200, 201), N=50 -> demote 150, 151.
-    # Req 1: one token (pos 20), N=50 -> none.
-    csl = torch.tensor([201, 202, 21], dtype=torch.int32, device="cuda")
-    req = torch.tensor([0, 0, 1], dtype=torch.int32, device="cuda")
-    bt = _page(3)
-    slots = kvarn_tail_demote_slots(csl, req, 50, bt, BLOCK)
-    assert slots.tolist() == [
-        3 * BLOCK + 150,
-        3 * BLOCK + 151,
-        -1,
-    ]
+def test_demote_ranges_noop_when_empty():
+    layout = _layout()
+    torch.manual_seed(5)
+    latent = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+    fp8 = _make_fp8_record(latent)
+    pool = torch.zeros(1, 64, layout.record_bytes, dtype=torch.uint8, device="cuda")
+    pool[0, :, :528] = fp8
+    before = pool.clone()
+    ranges = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
+    bt = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    kvarn_tail_demote_ranges(pool, ranges, bt, 64, layout, 64)
+    assert torch.equal(pool, before)
+
+
+def _make_fp8_record(latent: torch.Tensor) -> torch.Tensor:
+    T = latent.shape[0]
+    x = latent.to(torch.float32).reshape(T, 4, 128)
+    amax = x.abs().amax(dim=2, keepdim=True)
+    scale = torch.where(amax == 0, torch.ones_like(amax), amax / 448.0)
+    codes = (x / scale).to(torch.float8_e4m3fn)
+    rec = torch.zeros(T, 528, dtype=torch.uint8, device=latent.device)
+    rec[:, :512] = codes.reshape(T, 512).view(torch.uint8)
+    rec[:, 512:528] = scale.reshape(T, 4).view(torch.uint8)
+    return rec
 
 
 def test_merge_tail_lse():
@@ -104,12 +129,6 @@ def test_merge_tail_lse():
     assert torch.allclose(m2, (out_t * 1 + out_b * 2) / 3)
 
 
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
-
-
 def test_merge_tail_lse_nan_empty_segment():
     # A fully-masked segment produces lse=-inf and NaN output; the merge
     # must zero its contribution instead of propagating NaN (NaN * 0).
@@ -122,3 +141,9 @@ def test_merge_tail_lse_nan_empty_segment():
         torch.tensor([[float("-inf")]], device="cuda"),
     )
     assert torch.allclose(m, out_t), m
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

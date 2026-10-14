@@ -702,6 +702,8 @@ class B12xGLM5NextMLASparseBackend(B12xMLASparseBackend):
 @dataclass
 class B12xMLASparseMetadata(SparseMLACommonMetadata):
     dcp_global_seq_lens: torch.Tensor | None = None
+    kvarn_tail_hit_len: torch.Tensor | None = None
+    kvarn_tail_demote_ranges: torch.Tensor | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
     prefill_seq_lens_cpu: torch.Tensor | None = None
     cache_seq_lens_per_token: torch.Tensor | None = None
@@ -976,6 +978,10 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
 
         metadata.cache_seq_lens_per_token = per_token_lens
+        metadata.kvarn_tail_hit_len = getattr(common, "kvarn_tail_hit_len", None)
+        metadata.kvarn_tail_demote_ranges = getattr(
+            common, "kvarn_tail_demote_ranges", None
+        )
         metadata.is_spec_decode = _is_speculative_decode_batch(
             common,
             self._max_speculative_decode_query_len,
@@ -2151,20 +2157,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 return
             # Precision tail: newest N tokens store fp8_ds_mla records
             # inside the 536B slots; older tokens store kvarn records; the
-            # token crossing out of the window is re-quantized in place.
-            # Dispatch is shape-static: both writers see the full batch
-            # with non-mine slots masked to -1 (writers skip slot < 0).
+            # block-aligned boundary crossing re-quantizes the exiting
+            # records in place. Dispatch is shape-static: both writers see
+            # the full batch with non-mine slots masked to -1 (writers skip
+            # slot < 0).
             from vllm.v1.attention.backends.mla.kvarn_tail import (
                 kvarn_tail_classify,
-                kvarn_tail_demote_slots,
+                kvarn_tail_demote_ranges,
             )
 
             num_tokens = slots.shape[0]
             csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
             n_local = self._kvarn_tail_local_tokens
+            hit_len = getattr(attn_metadata, "kvarn_tail_hit_len", None)
             is_tail, boundary, _ = kvarn_tail_classify(
-                csl, req_ids, attn_metadata.num_reqs, n_local
+                csl, req_ids, attn_metadata.num_reqs, n_local, hit_len,
+                attn_metadata.block_size,
             )
             tail_slots = torch.where(is_tail.bool(), slots, slots.new_full((), -1))
             body_slots = torch.where(is_tail.bool(), slots.new_full((), -1), slots)
@@ -2174,16 +2183,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             self._concat_and_cache_glm_next_mla_kvarn(
                 kv_c_normed, kv_cache, body_slots, plan=plan
             )
-            demote_slots = kvarn_tail_demote_slots(
-                csl,
-                req_ids,
-                n_local,
-                attn_metadata.block_table,
-                attn_metadata.block_size,
-            )
-            from vllm.v1.attention.ops.kvarn_demote import demote_fp8_records
-
-            demote_fp8_records(kv_cache, demote_slots, self._kvarn_layout)
+            demote_ranges = getattr(attn_metadata, "kvarn_tail_demote_ranges", None)
+            if demote_ranges is not None:
+                kvarn_tail_demote_ranges(
+                    kv_cache,
+                    demote_ranges[: attn_metadata.num_reqs],
+                    attn_metadata.block_table,
+                    attn_metadata.block_size,
+                    self._kvarn_layout,
+                    num_tokens,
+                )
             return
         if self._uses_glm_dsa_nvfp4_cache:
             if kv_cache.numel() == 0:
@@ -2570,6 +2579,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 req_ids,
                 num_reqs,
                 n_local,
+                getattr(attn_metadata, "kvarn_tail_hit_len", None),
+                attn_metadata.block_size,
             )
             cols = torch.arange(n_local, device=csl.device)
             pos = boundary_local[:, None] + cols[None, :]
