@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-quiet-optional-kernel-probes",
+  "category": "fix",
+  "summary": "Startup no longer prints ERROR and WARNING lines about the Triton MoE kernels and the optional DeepSelect extension",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. The messages still appear with VLLM_LOGGING_LEVEL=DEBUG.",
+  "details": [
+    "The import-time probes for triton_kernels.matmul_ogs (fused MoE config and the MXFP4 oracle) and for vllm._deepselect_C now log at DEBUG. The image's triton_kernels is newer than the matmul_ogs API, and DeepSelect is opt-in and needs SM100a/SM103a, so these lines appeared on every start without affecting any shipped model.",
+    "Backend selection is unchanged."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    1024
+  ],
+  "requires": []
+}
