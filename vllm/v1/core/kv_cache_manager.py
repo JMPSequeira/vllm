@@ -188,12 +188,14 @@ class KVCacheManager:
         kvarn_tail_tokens: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
-        # KVarN precision tail: decode-phase-only recency window. The tail
-        # region [ts, S) holds fp8 records and is NEVER published to the
-        # prefix cache; at every extend (prefill chunk) the whole tail is
-        # demoted to kvarn and ts resets to S, so the ckv gather always
-        # reads uniform kvarn records and prompts stay fully cacheable.
-        # Decode allocations grow the tail; 0 disables the feature and
+        # KVarN precision tail: a SLIDING window of the newest N tokens,
+        # fp8 at all times (prefill chunks included). ts advances with S;
+        # boundary crossings emit demotion ranges (fp8 -> kvarn) for the
+        # worker. The tail region is never published to the prefix cache
+        # (published blocks always sit fully below ts = uniformly kvarn).
+        # The ckv-gather extend demotes the fp8 rows of its throwaway
+        # dense copy (kvarn_tail_demote_gathered), so the pool keeps the
+        # sliding fp8 window intact. 0 disables the feature and
         # reproduces the stock caching behavior exactly.
         self.kvarn_tail_tokens = int(kvarn_tail_tokens)
         self._kvarn_tail_start: dict[str, int] = {}
@@ -792,35 +794,22 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        # KVarN precision tail: the tail region is never published, and its
-        # boundary crossings emit demotion ranges for the worker (fp8 ->
-        # kvarn re-quantization of the exiting records). EXTENDS (prefill
-        # chunks) demote the WHOLE tail and reset ts to S: the ckv gather
-        # then always reads uniform kvarn records, and prompt tokens are
-        # fully publishable. Decode allocations grow the tail normally.
+        # KVarN precision tail: uniform sliding rule for extends and
+        # decodes alike — ts = max(align_up(S-N, bs), ts_old); the range
+        # [ts_old, ts_new) demotes in the pool, and the ckv-gather extend
+        # additionally demotes [ts, S) rows of its dense copy (the current
+        # chunk's own fp8 tokens) before the MG launch.
         if self.kvarn_tail_tokens:
             req_id = request.request_id
             block_size = self.coordinator.single_type_managers[0].block_size
             ts_old = self._kvarn_tail_start.get(req_id, 0)
-            is_extend = num_tokens_to_cache > ts_old and (
-                request.num_computed_tokens + num_new_tokens
-                <= request.num_prompt_tokens
+            ts_new = max(
+                -(-max(num_tokens_to_cache - self.kvarn_tail_tokens, 0) // block_size)
+                * block_size,
+                ts_old,
             )
-            if is_extend:
-                if ts_old < num_tokens_to_cache:
-                    # everything above ts_old is decode-phase fp8
-                    self._kvarn_tail_demotions.append(
-                        (req_id, ts_old, num_tokens_to_cache)
-                    )
-                ts_new = num_tokens_to_cache
-            else:
-                ts_new = max(
-                    -(-max(num_tokens_to_cache - self.kvarn_tail_tokens, 0) // block_size)
-                    * block_size,
-                    ts_old,
-                )
-                if ts_new > ts_old:
-                    self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
+            if ts_new > ts_old:
+                self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
             self._kvarn_tail_start[req_id] = ts_new
             num_tokens_to_cache = min(num_tokens_to_cache, ts_new)
         self.coordinator.cache_blocks(request, num_tokens_to_cache)

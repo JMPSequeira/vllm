@@ -2175,12 +2175,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     kv_c_normed, kv_cache, slots, plan=plan
                 )
                 return
-            # Precision tail: decode-phase stores split fp8 (pos >= ts) vs
-            # kvarn (pos < ts); EXTEND steps store everything as kvarn (the
-            # manager reset ts to S and emitted a demote range covering the
-            # whole decode-phase tail, so the ckv gather always sees
-            # uniform kvarn). Dispatch is shape-static: both writers see
-            # the full batch with non-mine slots masked to -1 (writers skip
+            # Precision tail: uniform sliding rule — stores split fp8
+            # (pos >= ts) vs kvarn (pos < ts) for extends and decodes
+            # alike. Dispatch is shape-static: both writers see the full
+            # batch with non-mine slots masked to -1 (writers skip
             # slot < 0).
             from vllm.v1.attention.backends.mla.kvarn_tail import (
                 kvarn_tail_boundary,
@@ -2190,38 +2188,33 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             num_tokens = slots.shape[0]
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
             demote_ranges = getattr(attn_metadata, "kvarn_tail_demote_ranges", None)
-            if attn_metadata.num_prefills > 0:
-                self._concat_and_cache_glm_next_mla_kvarn(
-                    kv_c_normed, kv_cache, slots, plan=plan
-                )
+            csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
+            ts = getattr(attn_metadata, "kvarn_tail_start", None)
+            if ts is None:
+                boundary = None
             else:
-                csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
-                ts = getattr(attn_metadata, "kvarn_tail_start", None)
-                if ts is None:
-                    boundary = None
-                else:
-                    boundary = kvarn_tail_boundary(
-                        ts[: attn_metadata.num_reqs], req_ids
-                    )
-                if boundary is None:
-                    # warmup/profile forward: no manager state yet; store
-                    # everything as kvarn (the dummy cache is discarded).
-                    tail_slots = slots.new_full(slots.shape, -1)
-                    body_slots = slots
-                else:
-                    is_tail = (csl - 1) >= boundary
-                    tail_slots = torch.where(
-                        is_tail.bool(), slots, slots.new_full((), -1)
-                    )
-                    body_slots = torch.where(
-                        is_tail.bool(), slots.new_full((), -1), slots
-                    )
-                self._module.concat_and_cache_glm_next_mla_fp8_tail(
-                    kv_c_normed, kv_cache, tail_slots, plan=tail_plan
+                boundary = kvarn_tail_boundary(
+                    ts[: attn_metadata.num_reqs], req_ids
                 )
-                self._concat_and_cache_glm_next_mla_kvarn(
-                    kv_c_normed, kv_cache, body_slots, plan=plan
+            if boundary is None:
+                # warmup/profile forward: no manager state yet; store
+                # everything as kvarn (the dummy cache is discarded).
+                tail_slots = slots.new_full(slots.shape, -1)
+                body_slots = slots
+            else:
+                is_tail = (csl - 1) >= boundary
+                tail_slots = torch.where(
+                    is_tail.bool(), slots, slots.new_full((), -1)
                 )
+                body_slots = torch.where(
+                    is_tail.bool(), slots.new_full((), -1), slots
+                )
+            self._module.concat_and_cache_glm_next_mla_fp8_tail(
+                kv_c_normed, kv_cache, tail_slots, plan=tail_plan
+            )
+            self._concat_and_cache_glm_next_mla_kvarn(
+                kv_c_normed, kv_cache, body_slots, plan=plan
+            )
             if demote_ranges is not None:
                 kvarn_tail_demote_ranges(
                     kv_cache,
@@ -2354,36 +2347,25 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             local_buffer[:padded_tokens].view(-1),
             staging[: self.dcp_world_size * padded_tokens].view(-1),
         )
-        if self._uses_kvarn_cache:
-            # Mirror the pool's tile geometry into the arena: the decode
-            # kernel addresses block*stride + tile*tile_stride + row*record
-            # from plan constants; with page == tile for the gathered cache
-            # every selected row lands at its true record offset.
-            layout = self._kvarn_layout
-            tile_tokens = int(layout.group)
-            record = self._cache_record_bytes
-            tile_stride = int(layout.tile_stride_bytes)
-            used_rows = self.dcp_world_size * padded_tokens
-            tiles = used_rows // tile_tokens
-            staging_bytes = capacity_rows * record
-            arena = gathered_buffer[staging_bytes:].as_strided(
-                (tiles, tile_tokens, record), (tile_stride, record, 1)
-            )
-            arena.view(tiles, tile_tokens * record).copy_(
-                staging[:used_rows].view(tiles, tile_tokens * record)
-            )
-            if os.environ.get("KVARN_GATHER_DEBUG") == "1":
-                self._dbg_postcopy = arena.reshape(-1, record)[:24].clone()
-            # The per-tile tail sits AFTER the tile's records (tile_base +
-            # tile_tokens*record .. +tile_stride); zero it every gather so
-            # stale workspace bytes never dequantize into garbage scales.
-            gathered_buffer[
-                staging_bytes + tile_tokens * record:
-            ].as_strided(
-                (tiles, tile_stride - tile_tokens * record),
-                (tile_stride, 1),
-            ).zero_()
-            return arena
+        # KVarN precision tail: rows the current chunks stored as fp8
+        # (positions >= ts per request, per rank segment) must read as
+        # kvarn in the single MG prefill launch. Demote the throwaway
+        # dense copies in place; the pool keeps the sliding fp8 window.
+        if self._kvarn_tail_local_tokens > 0:
+            ts = getattr(attn_metadata, "kvarn_tail_start", None)
+            if ts is not None:
+                from vllm.v1.attention.backends.mla.kvarn_tail import (
+                    kvarn_tail_demote_gathered,
+                )
+
+                kvarn_tail_demote_gathered(
+                    gathered_buffer[: self.dcp_world_size * padded_tokens],
+                    attn_metadata.dcp_local_cu_seq_lens,
+                    ts[: attn_metadata.num_reqs],
+                    padded_tokens,
+                    self.dcp_world_size,
+                    self._kvarn_layout,
+                )
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
         )

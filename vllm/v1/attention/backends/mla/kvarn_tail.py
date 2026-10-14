@@ -77,6 +77,70 @@ def kvarn_tail_positions_to_slots(
 
 
 @triton.jit
+def _kvarn_demote_record(
+    base,  # *u8 pointer to the record (528B fp8 content + pad)
+    k_bits: tl.constexpr,
+    v_bits: tl.constexpr,
+    record_bytes: tl.constexpr,
+    latent_dim: tl.constexpr,
+    group: tl.constexpr,
+):
+    """Re-quantize one fp8_ds_mla record in place to a kvarn record.
+
+    Bit-exact vs pack_kvarn_mla_records(dequant(fp8)): reciprocal-multiply
+    scale (torch tensor/python-int division semantics), sub_rn (blocks LLVM
+    fma contraction of vals*sp - mn), rint.
+    """
+    k_code_bytes: tl.constexpr = (latent_dim * k_bits + 7) // 8
+    v_code_bytes: tl.constexpr = (latent_dim * v_bits + 7) // 8
+    code_region: tl.constexpr = k_code_bytes + v_code_bytes
+    content_bytes: tl.constexpr = code_region + 8
+    k_scale_off: tl.constexpr = code_region
+    k_zp_off: tl.constexpr = k_scale_off + 2
+    v_scale_off: tl.constexpr = k_zp_off + 2
+    v_zp_off: tl.constexpr = v_scale_off + 2
+
+    levels_k: tl.constexpr = (1 << k_bits) - 1
+    inv_k: tl.constexpr = 1.0 / ((1 << k_bits) - 1)
+    levels_v: tl.constexpr = (1 << v_bits) - 1
+    inv_v: tl.constexpr = 1.0 / ((1 << v_bits) - 1)
+
+    d = tl.arange(0, latent_dim)
+    fp8_bytes = tl.load(base + d)
+    vals = tl.cast(fp8_bytes, tl.float8e4nv, bitcast=True).to(tl.float32)
+    g = tl.arange(0, 4)
+    scales = tl.load(base.to(tl.pointer_type(tl.float32)) + 128 + g)
+    scale_per_dim = tl.gather(scales, d // group, 0)
+    latent = vals * scale_per_dim
+    mn = tl.min(latent, axis=0)
+    mx = tl.max(latent, axis=0)
+    pad_idx = tl.arange(0, 16)
+    tl.store(
+        base + content_bytes + pad_idx,
+        tl.zeros((16,), tl.uint8),
+        mask=pad_idx < (record_bytes - content_bytes),
+    )
+    scale_k = tl.maximum(mx - mn, 1e-8) * inv_k
+    sub = tl.extra.cuda.libdevice.sub_rn(latent, mn)
+    codes_k = tl.extra.cuda.libdevice.rint(
+        tl.extra.cuda.libdevice.div_rn(sub, scale_k)
+    ).to(tl.int32)
+    codes_k = tl.minimum(tl.maximum(codes_k, 0), levels_k)
+    _kvarn_pack_codes(codes_k, k_bits, base, latent_dim)
+    scale_v = tl.maximum(mx - mn, 1e-8) * inv_v
+    codes_v = tl.extra.cuda.libdevice.rint(
+        tl.extra.cuda.libdevice.div_rn(sub, scale_v)
+    ).to(tl.int32)
+    codes_v = tl.minimum(tl.maximum(codes_v, 0), levels_v)
+    _kvarn_pack_codes(codes_v, v_bits, base + k_code_bytes, latent_dim)
+    base_f16 = base.to(tl.pointer_type(tl.float16))
+    tl.store(base_f16 + k_scale_off // 2, scale_k.to(tl.float16))
+    tl.store(base_f16 + k_zp_off // 2, mn.to(tl.float16))
+    tl.store(base_f16 + v_scale_off // 2, scale_v.to(tl.float16))
+    tl.store(base_f16 + v_zp_off // 2, mn.to(tl.float16))
+
+
+@triton.jit
 def _kvarn_tail_demote_ranges_kernel(
     kv_cache_ptr,  # *u8 [pages, page_size, record_bytes]
     ranges_ptr,  # int32 [num_reqs, 2]: (lo, hi) demotion positions, (0,0)=none
@@ -97,9 +161,7 @@ def _kvarn_tail_demote_ranges_kernel(
 
     One program per (request, CHUNK-position slice); programs whose slice
     starts past the range exit immediately, so the common no-crossing step
-    is a cheap no-op launch. The per-slot body mirrors
-    ``ops/kvarn_demote._kvarn_demote_kernel`` (bit-exact vs the torch
-    reference pack: reciprocal-multiply scale, sub_rn, rint).
+    is a cheap no-op launch.
     """
     req = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -110,24 +172,6 @@ def _kvarn_tail_demote_ranges_kernel(
         return
     end = tl.minimum(hi, start + CHUNK)
 
-    k_code_bytes: tl.constexpr = (latent_dim * k_bits + 7) // 8
-    v_code_bytes: tl.constexpr = (latent_dim * v_bits + 7) // 8
-    code_region: tl.constexpr = k_code_bytes + v_code_bytes
-    content_bytes: tl.constexpr = code_region + 8
-    k_scale_off: tl.constexpr = code_region
-    k_zp_off: tl.constexpr = k_scale_off + 2
-    v_scale_off: tl.constexpr = k_zp_off + 2
-    v_zp_off: tl.constexpr = v_scale_off + 2
-
-    levels_k: tl.constexpr = (1 << k_bits) - 1
-    inv_k: tl.constexpr = 1.0 / ((1 << k_bits) - 1)
-    levels_v: tl.constexpr = (1 << v_bits) - 1
-    inv_v: tl.constexpr = 1.0 / ((1 << v_bits) - 1)
-
-    d = tl.arange(0, latent_dim)
-    pad_idx = tl.arange(0, 16)
-    g = tl.arange(0, 4)
-
     for pos in range(start, end):
         blk = tl.load(block_table_ptr + req.to(tl.int64) * max_blocks + pos // BLOCK_SIZE)
         slot = blk * BLOCK_SIZE + pos % BLOCK_SIZE
@@ -136,39 +180,9 @@ def _kvarn_tail_demote_ranges_kernel(
             + (slot // page_size) * tl.cast(cache_stride0, tl.int64)
             + (slot % page_size) * tl.cast(cache_stride1, tl.int64)
         )
-        fp8_bytes = tl.load(base + d)
-        vals = tl.cast(fp8_bytes, tl.float8e4nv, bitcast=True).to(tl.float32)
-        scales = tl.load(base.to(tl.pointer_type(tl.float32)) + 128 + g)
-        scale_per_dim = tl.gather(scales, d // group, 0)
-        latent = vals * scale_per_dim
-        mn = tl.min(latent, axis=0)
-        mx = tl.max(latent, axis=0)
-        pad_mask = pad_idx < (record_bytes - content_bytes)
-        tl.store(
-            base + content_bytes + pad_idx,
-            tl.zeros((16,), tl.uint8),
-            mask=pad_mask,
+        _kvarn_demote_record(
+            base, k_bits, v_bits, record_bytes, latent_dim, group
         )
-        # torch tensor/python-int division lowers to a reciprocal multiply;
-        # the storage contract (pack_kvarn_mla_records) uses that path.
-        scale_k = tl.maximum(mx - mn, 1e-8) * inv_k
-        sub = tl.extra.cuda.libdevice.sub_rn(latent, mn)
-        codes_k = tl.extra.cuda.libdevice.rint(
-            tl.extra.cuda.libdevice.div_rn(sub, scale_k)
-        ).to(tl.int32)
-        codes_k = tl.minimum(tl.maximum(codes_k, 0), levels_k)
-        _kvarn_pack_codes(codes_k, k_bits, base, latent_dim)
-        scale_v = tl.maximum(mx - mn, 1e-8) * inv_v
-        codes_v = tl.extra.cuda.libdevice.rint(
-            tl.extra.cuda.libdevice.div_rn(sub, scale_v)
-        ).to(tl.int32)
-        codes_v = tl.minimum(tl.maximum(codes_v, 0), levels_v)
-        _kvarn_pack_codes(codes_v, v_bits, base + k_code_bytes, latent_dim)
-        base_f16 = base.to(tl.pointer_type(tl.float16))
-        tl.store(base_f16 + k_scale_off // 2, scale_k.to(tl.float16))
-        tl.store(base_f16 + k_zp_off // 2, mn.to(tl.float16))
-        tl.store(base_f16 + v_scale_off // 2, scale_v.to(tl.float16))
-        tl.store(base_f16 + v_zp_off // 2, mn.to(tl.float16))
 
 
 def kvarn_tail_demote_ranges(
@@ -222,6 +236,87 @@ def kvarn_tail_demote_ranges(
         latent_dim=layout.latent_dim,
         group=128,
         BLOCK_SIZE=block_size,
+        CHUNK=256,
+        num_warps=4,
+    )
+
+
+
+@triton.jit
+def _kvarn_tail_demote_gathered_kernel(
+    gathered_ptr,  # *u8 contiguous [ws*padded, record_bytes] dense records
+    cu_ptr,  # int32 [num_reqs+1]: per-request row starts (local rows)
+    ts_ptr,  # int32 [num_reqs]: tail start (local positions)
+    record_bytes: tl.constexpr,
+    k_bits: tl.constexpr,
+    v_bits: tl.constexpr,
+    latent_dim: tl.constexpr,
+    group: tl.constexpr,
+    PADDED: tl.constexpr,
+    WS: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    """Demote the fp8 tail rows of a gathered dense CKV buffer.
+
+    The gather copies whole pool records; rows the current chunk stored as
+    fp8 (positions >= ts, i.e. rows [cu_start+ts, cu_end) per request per
+    rank segment) must read as kvarn in the single MG prefill launch. The
+    pool originals stay fp8 -- only the throwaway dense copies flip.
+    """
+    req = tl.program_id(0)
+    rank = tl.program_id(1)
+    chunk = tl.program_id(2)
+    cu_start = tl.load(cu_ptr + req)
+    cu_end = tl.load(cu_ptr + req + 1)
+    ts = tl.load(ts_ptr + req)
+    row0 = rank * PADDED + cu_start + ts + chunk * CHUNK
+    row_end = rank * PADDED + cu_end
+    if row0 >= row_end:
+        return
+    stop = tl.minimum(row_end, row0 + CHUNK)
+    for row in range(row0, stop):
+        base = gathered_ptr + row.to(tl.int64) * record_bytes
+        _kvarn_demote_record(
+            base, k_bits, v_bits, record_bytes, latent_dim, group
+        )
+
+
+def kvarn_tail_demote_gathered(
+    gathered: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    tail_start: torch.Tensor,
+    padded_tokens: int,
+    dcp_world_size: int,
+    layout,
+) -> None:
+    """Demote fp8 tail rows of the gathered dense CKV buffer in place.
+
+    Args:
+        gathered: ``[rows, record_bytes]`` uint8 dense gather buffer (the
+            ``[*, page, record]`` view flattened), rank-major segments of
+            ``padded_tokens`` rows each.
+        cu_seq_lens: ``[num_reqs+1]`` int32 local row starts per request.
+        tail_start: ``[num_reqs]`` int32 ts per request.
+        padded_tokens: per-rank padded row count.
+        dcp_world_size: DCP world size (rank segments).
+        layout: kvarn record geometry.
+    """
+    num_reqs = tail_start.shape[0]
+    if num_reqs == 0:
+        return
+    chunks = (padded_tokens + 255) // 256 + 1
+    grid = (num_reqs, dcp_world_size, chunks)
+    _kvarn_tail_demote_gathered_kernel[grid](
+        gathered.reshape(-1),
+        cu_seq_lens,
+        tail_start,
+        record_bytes=layout.record_bytes,
+        k_bits=layout.k_bits,
+        v_bits=layout.v_bits,
+        latent_dim=layout.latent_dim,
+        group=128,
+        PADDED=padded_tokens,
+        WS=dcp_world_size,
         CHUNK=256,
         num_warps=4,
     )
