@@ -2197,16 +2197,25 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             else:
                 csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
                 ts = getattr(attn_metadata, "kvarn_tail_start", None)
-                boundary = kvarn_tail_boundary(
-                    ts[: attn_metadata.num_reqs], req_ids
-                )
-                is_tail = (csl - 1) >= boundary
-                tail_slots = torch.where(
-                    is_tail.bool(), slots, slots.new_full((), -1)
-                )
-                body_slots = torch.where(
-                    is_tail.bool(), slots.new_full((), -1), slots
-                )
+                if ts is None:
+                    boundary = None
+                else:
+                    boundary = kvarn_tail_boundary(
+                        ts[: attn_metadata.num_reqs], req_ids
+                    )
+                if boundary is None:
+                    # warmup/profile forward: no manager state yet; store
+                    # everything as kvarn (the dummy cache is discarded).
+                    tail_slots = slots.new_full(slots.shape, -1)
+                    body_slots = slots
+                else:
+                    is_tail = (csl - 1) >= boundary
+                    tail_slots = torch.where(
+                        is_tail.bool(), slots, slots.new_full((), -1)
+                    )
+                    body_slots = torch.where(
+                        is_tail.bool(), slots.new_full((), -1), slots
+                    )
                 self._module.concat_and_cache_glm_next_mla_fp8_tail(
                     kv_c_normed, kv_cache, tail_slots, plan=tail_plan
                 )
@@ -2450,10 +2459,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
+        ts = getattr(attn_metadata, "kvarn_tail_start", None)
         tail_active = (
             self._uses_kvarn_cache
             and self._kvarn_tail_local_tokens > 0
             and not use_ckv_gather
+            and ts is not None
         )
         if tail_active:
             # Precision tail: drop body selections inside the tail window
@@ -2469,7 +2480,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
             num_reqs = int(attn_metadata.num_reqs)
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
-            ts = getattr(attn_metadata, "kvarn_tail_start", None)
             boundary_global = kvarn_tail_global_boundary(
                 ts[:num_reqs],
                 req_ids,
