@@ -1508,7 +1508,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             kv_dtype=self._kv_dtype,
             head_dim=self._q_head_dim,
             v_head_dim=self.kv_lora_rank,
-            mode="extend" if mode == "ckv_extend" else mode,
+            mode="extend" if mode == "ckv_extend" else (
+                # decode_tail launches the plain decode kernel; the tail is
+                # identified by model_type (KVARN_TAIL_FP8), not by mode.
+                "decode" if mode == "decode_tail" else mode
+            ),
             max_batch=rows,
             max_chunks_per_row=max(1, (self._topk_tokens + 63) // 64),
             page_size=self._kernel_page_size,
@@ -2591,7 +2595,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 req_ids.unsqueeze(1).expand_as(pos),
                 attn_metadata.block_table,
                 attn_metadata.block_size,
-            )
+            ).to(torch.int32)
             tail_indices = torch.where(
                 valid, tail_indices, torch.full((), -1, dtype=tail_indices.dtype, device=tail_indices.device)
             )
