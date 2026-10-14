@@ -1371,6 +1371,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     )
                 self._kvarn_tail_local_tokens = tail_tokens // dcp_size
                 self._kvarn_tail_tokens = tail_tokens
+                logger.info(
+                    "kvarn precision tail: %d tokens (%d per DCP rank), "
+                    "record_bytes=%d",
+                    tail_tokens,
+                    self._kvarn_tail_local_tokens,
+                    self._kvarn_layout.record_bytes,
+                )
                 self._concat_and_cache_glm_next_mla_fp8_tail = (
                     module.concat_and_cache_glm_next_mla_fp8_tail
                 )
@@ -1454,6 +1461,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         # Plan declarations read the page size.
         self._kernel_page_size = kernel_page_size
         keys = [("decode", self._decode_max_rows), ("extend", self._max_tokens)]
+        if self._uses_kvarn_cache and self._kvarn_tail_local_tokens > 0:
+            keys.append(("extend_tail", self._max_tokens))
         if self._ckv_gather_enabled:
             keys.append(("ckv_extend", self._max_tokens))
         self._plans = {}
@@ -1493,7 +1502,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         segment: the KVARN_TAIL_FP8 arm (GLM fp8 math over 536B pool rows)
         attending the dense tail window.
         """
-        tail_mode = mode == "decode_tail"
+        tail_mode = mode in ("decode_tail", "extend_tail")
         caps_kwargs = dict(
             device=torch.device("cuda", torch.accelerator.current_device_index()),
             num_q_heads=(
@@ -1554,9 +1563,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 # kernel has no KVARN_DUAL arm (its bulk-record IO requires
                 # 16B-aligned records), and at 16 local q heads (= one head
                 # group) the decode kernel amortizes the same KV gather.
+                # 4096 rows saturate the SMs, so the split-K depth is tiny;
+                # the scratch is rows x chunks x heads x 512 x 2B and the
+                # uncapped chunk count (33) would over-provision it ~16x.
+                # The adaptive split config covers the full width with few
+                # chunks (the same contract as the body extend plan); for
+                # extend_tail this cap is what keeps the scratch at ~268 MB
+                # instead of rows x 64 chunks (~8.6 GB at 4096 rows).
                 caps_kwargs["mode"] = "decode"
                 caps_kwargs["num_q_heads"] = self._kernel_num_heads
-                caps_kwargs.pop("decode_max_rows", None)
+                caps_kwargs["max_chunks_per_row"] = 2
         if self._uses_nvfp4_cache:
             caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         caps = self._module.Caps(**caps_kwargs)
@@ -2600,7 +2616,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 valid, tail_indices, torch.full((), -1, dtype=tail_indices.dtype, device=tail_indices.device)
             )
             tail_lengths = (s_local - boundary_local).clamp_max_(n_local)
-            tail_plan = self._plan(("decode_tail", num_tokens))
+            tail_plan = self._plan(
+                ("decode_tail", num_tokens)
+                if plan_key[0] == "decode"
+                else ("extend_tail", self._max_tokens)
+            )
             tail_binding = self._bind(
                 tail_plan,
                 scratch=scratch,
