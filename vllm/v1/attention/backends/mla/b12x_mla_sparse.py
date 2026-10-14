@@ -517,6 +517,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "nvfp4_ds_mla",
         "kvarn_mla_k4v4_g256",
         "kvarn_mla_k5v5_g256",
+        "kvarn_mla_k5v4_g256",
         "kvarn_mla_k4v2_g256",
     ]
 

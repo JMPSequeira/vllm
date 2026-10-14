@@ -60,6 +60,7 @@ CacheDType = Literal[
     # g<group> == cache block size. Opaque uint8 pages, B12X sparse MLA.
     "kvarn_mla_k4v4_g256",
     "kvarn_mla_k5v5_g256",
+    "kvarn_mla_k5v4_g256",
     "kvarn_mla_k4v2_g256",
 ]
 
