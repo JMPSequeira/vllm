@@ -816,7 +816,14 @@ class KVCacheManager:
                     req_id, num_tokens_to_cache, self.kvarn_tail_tokens,
                     block_size, ts_old, ts_new,
                 )
-            if ts_new > ts_old:
+            # A demotion range [ts_old, ts_new) may only cover rows that
+            # WERE fp8 -- i.e. rows stored while the boundary was ts_old.
+            # On the first allocation ts_old=0 but the whole chunk was just
+            # stored kvarn (the store used the new boundary), so demoting
+            # [0, ts_new) reads kvarn records as fp8 and requantizes the
+            # early context into garbage (the lock-loop signature). Same
+            # for a prefix-hit request: the hit rows are never fp8.
+            if ts_old > 0 and ts_new > ts_old:
                 self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
             self._kvarn_tail_start[req_id] = ts_new
             num_tokens_to_cache = min(num_tokens_to_cache, ts_new)
