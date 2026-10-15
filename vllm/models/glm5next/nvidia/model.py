@@ -112,6 +112,9 @@ GLM5NEXT_PACKED_MODULES_MAPPING = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
     "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
+    # Mixed-format KDA (q/k/v in one format, b/f_a in another) runs two GEMMs.
+    "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+    "in_proj_bfa": ["b_proj", "f_a_proj"],
     "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
 }
 
@@ -1163,6 +1166,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             (".in_proj_qkvgfab", ".v_proj", 2),
             (".in_proj_qkvgfab", ".b_proj", 3),
             (".in_proj_qkvgfab", ".f_a_proj", 4),
+            # Mixed-format KDA layers own split q|k|v and b|f_a projections.
+            (".in_proj_qkv", ".q_proj", 0),
+            (".in_proj_qkv", ".k_proj", 1),
+            (".in_proj_qkv", ".v_proj", 2),
+            (".in_proj_bfa", ".b_proj", 0),
+            (".in_proj_bfa", ".f_a_proj", 1),
             (".conv1d", ".q_conv1d", 0),
             (".conv1d", ".k_conv1d", 1),
             (".conv1d", ".v_conv1d", 2),
@@ -1262,6 +1271,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 name_mapped = name.replace(weight_name, param_name)
                 # QKV fusion: skip if fused module doesn't exist in model
                 if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
+                    continue
+                # A KDA layer owns either the fused or the split input projection.
+                if (
+                    param_name.startswith(".in_proj_")
+                    and name_mapped not in params_dict
+                ):
                     continue
                 name = name_mapped
                 # Skip loading extra bias for GPTQ models.
