@@ -3040,6 +3040,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     if plan_key[0] == "decode"
                     else ("extend_tail", self._max_tokens)
                 )
+            # A page-granular ts can sit at or above a row's S (the manager
+            # publishes whole pages below S-N, so the fp8 window is empty
+            # whenever the last partial page is kvarn). An empty window must
+            # still launch with >=1 candidate or the arm's softmax yields a
+            # NaN LSE that poisons the merge: clamp to 1 candidate that is
+            # fully masked (-1) -- its partials are the merge identity.
+            tail_indices = torch.where(
+                tail_lengths > 0,
+                tail_indices,
+                torch.full((), -1, dtype=tail_indices.dtype,
+                           device=tail_indices.device),
+            )
+            tail_lengths = tail_lengths.clamp_min(1)
             tail_binding = self._bind(
                 tail_plan,
                 scratch=scratch,

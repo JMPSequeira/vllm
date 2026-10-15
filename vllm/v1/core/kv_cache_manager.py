@@ -28,6 +28,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+import os
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
@@ -808,6 +809,13 @@ class KVCacheManager:
                 * block_size,
                 ts_old,
             )
+            if os.environ.get("KVARN_TAIL_DEBUG"):
+                logger.warning(
+                    "KVARN_TAIL_DEBUG mgr: req=%s ntc=%d N=%d bs=%d "
+                    "ts_old=%d ts_new=%d",
+                    req_id, num_tokens_to_cache, self.kvarn_tail_tokens,
+                    block_size, ts_old, ts_new,
+                )
             if ts_new > ts_old:
                 self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
             self._kvarn_tail_start[req_id] = ts_new
