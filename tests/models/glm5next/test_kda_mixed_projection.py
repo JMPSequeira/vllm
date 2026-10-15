@@ -128,3 +128,54 @@ def test_block_fp8_weights_dequantize_without_running_the_linear():
     ].repeat_interleave(128, 1)
     assert result.shape == (out_rows, in_cols)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_kda_activation_option_marks_projections(monkeypatch):
+    """a16 tags every call for W8A16; prefill tags the layer for a second plan."""
+    import vllm.envs as envs
+    from vllm.models.glm5next.nvidia.kda import mark_b12x_activation_mode
+
+    monkeypatch.setenv("VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE", "prefill")
+    assert envs.VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE == "prefill"
+    monkeypatch.delenv("VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE")
+    assert envs.VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE == "auto"
+
+    a16, prefill, auto = (torch.nn.Linear(8, 8) for _ in range(3))
+    mark_b12x_activation_mode((a16,), "a16")
+    mark_b12x_activation_mode((prefill,), "prefill")
+    mark_b12x_activation_mode((auto,), "auto")
+    assert a16.b12x_activation_mode == "a16"
+    assert prefill.b12x_prefill_a16 and not hasattr(prefill, "b12x_activation_mode")
+    assert not hasattr(auto, "b12x_activation_mode")
+    assert not hasattr(auto, "b12x_prefill_a16")
+
+
+def test_prefill_holder_takes_prefill_sized_calls(monkeypatch):
+    """Calls of at least 128 rows run the A16 plan; shorter ones keep the default."""
+    from vllm.utils import b12x as b12x_utils
+
+    calls = []
+
+    class Holder:
+        def __init__(self, tag, workspace):
+            self.tag, self.workspace = tag, workspace
+
+        def run(self, source, bias):
+            calls.append(self.tag)
+            return source
+
+        def get_workspace_size(self, rows):
+            return self.workspace
+
+    layer = torch.nn.Module()
+    layer.b12x_linear = Holder("auto", 100)
+    layer.b12x_linear_prefill = Holder("a16", 4096)
+    monkeypatch.setattr(b12x_utils, "b12x_layer", lambda name: layer)
+    monkeypatch.setattr(b12x_utils, "_resolve_layer_name", lambda name: name)
+    rows = b12x_utils.B12X_MXFP8_PREFILL_A16_MIN_ROWS
+    for m in (1, 8, rows - 1, rows, 4096):
+        b12x_utils._b12x_blockscaled_linear(torch.zeros(m, 16), None, 16, "layer")
+    assert calls == ["auto", "auto", "auto", "a16", "a16"]
+    assert b12x_utils.get_b12x_projection_workspace_sizes(1, layer) == (4096,)
+    layer.b12x_linear_prefill = None
+    assert b12x_utils.get_b12x_projection_workspace_sizes(1, layer) == (100,)
