@@ -992,7 +992,7 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
                 prefill_start : prefill_start + metadata.num_prefills
             ].clone()
-        if _use_b12x_full_ckv_gather(
+        _gather_gate = self._uses_kvarn_cache and _use_b12x_full_ckv_gather(
             enabled=self._ckv_gather_requested,
             is_glm_next=self.requires_glm_next_selector_metadata,
             # GLM DSA gathers only in eager prefill: captured graphs and
