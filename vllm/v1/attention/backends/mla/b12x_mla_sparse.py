@@ -3001,7 +3001,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 n_tail = self._kvarn_tail_tokens
                 cols = torch.arange(n_tail, device=csl.device)
                 pos = boundary_global[:, None] + cols[None, :]
-                valid = pos < cache_seq_lens[:, None]
+                # Window end = the UNCLAMPED per-token S: the body stops at
+                # the boundary, so the tail owns [boundary, S) -- including
+                # the current chunk's own just-stored fp8 rows. Validating
+                # against the clamped lens made the tail empty on chunk 2+
+                # and dropped the context's last N tokens entirely.
+                valid = pos < full_cache_lens[:, None]
                 pos = torch.where(
                     valid, pos, torch.full((), -1, dtype=pos.dtype)
                 ).to(torch.int32)
