@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-csf-block-loader",
+  "category": "feature",
+  "summary": "FP4-CSF checkpoints load through FlashInfer's new B12X CSF path, including checkpoints in the csf_32x2_v1 block encoding",
+  "models": [
+    "GLM-5.3-Flash",
+    "GLM-5.3",
+    "DeepSeek-V4.1-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. Checkpoints with slab CSF scales keep loading; csf_32x2_v1 checkpoints now load as well.",
+  "details": [
+    "Restores the CSF block loader (84c0704f8f and 3a947437cf), reverted on 2026-10-14 while the image's FlashInfer lacked b12x.loader._csf_source and b12x.loader._csf_blocks. The canonical FlashInfer branch now carries FlashInfer main, which ships them.",
+    "Compressed scales are prepared on CUDA and expanded into native scale buffers before the expert GEMMs instead of being decoded inline. On GLM-5.3-Flash TP2 (RTX PRO 6000) the weights load in 83 s instead of 100 s and take 0.54 GiB less per GPU; decode at eight concurrent requests is about 7% slower per step, which is being investigated."
+  ],
+  "authors": [
+    "lukealonso",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    1029
+  ],
+  "requires": []
+}
