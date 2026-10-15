@@ -796,17 +796,22 @@ class KVCacheManager:
             request.num_tokens,
         )
         # KVarN precision tail: uniform sliding rule for extends and
-        # decodes alike — ts = max(align_up(S-N, bs), ts_old); the range
-        # [ts_old, ts_new) demotes in the pool, and the ckv-gather extend
-        # additionally demotes [ts, S) rows of its dense copy (the current
-        # chunk's own fp8 tokens) before the MG launch.
+        # decodes alike — ts = max(S-N, ts_old), UNALIGNED. The fp8 set is
+        # then exactly [ts, S) by construction: every store writes fp8 for
+        # pos >= the boundary in effect at store time, and the demotion
+        # [ts_old, ts_new) covers exactly the rows that were fp8 under
+        # ts_old (ts_new = S-N <= S_prev-N < S_prev always). Page-aligning
+        # ts instead (align_up(S-N, page)) put ts at/above S whenever
+        # N < page: the fp8 window was empty while the demotion still
+        # requantized kvarn rows as fp8 -- destroyed context, the
+        # lock-loop signature. Prefix-cache safety lives in the PUBLISH
+        # cap below: only whole pages fully below ts are published.
         if self.kvarn_tail_tokens:
             req_id = request.request_id
             block_size = self.coordinator.single_type_managers[0].block_size
             ts_old = self._kvarn_tail_start.get(req_id, 0)
             ts_new = max(
-                -(-max(num_tokens_to_cache - self.kvarn_tail_tokens, 0) // block_size)
-                * block_size,
+                num_tokens_to_cache - self.kvarn_tail_tokens,
                 ts_old,
             )
             if os.environ.get("KVARN_TAIL_DEBUG"):
@@ -817,19 +822,20 @@ class KVCacheManager:
                     block_size, ts_old, ts_new,
                 )
             # A demotion range may only cover rows that WERE fp8 -- rows
-            # stored while the boundary was ts_old, i.e. [ts_old, S_prev)
-            # where S_prev = total_computed_tokens. Rows at/after S_prev
-            # belong to the current chunk (stored kvarn under ts_new) and
-            # rows below ts_old were never fp8 under this request (first
-            # allocation: ts_old=0; prefix-hit rows: never fp8). Demoting
-            # outside [ts_old, S_prev) reads kvarn records as fp8 and
-            # requantizes them into garbage (the lock-loop signature).
-            if ts_old > 0:
-                hi = min(ts_new, total_computed_tokens)
-                if hi > ts_old:
-                    self._kvarn_tail_demotions.append((req_id, ts_old, hi))
+            # stored while the boundary was ts_old. On the first
+            # allocation ts_old=0 but the chunk was stored under the NEW
+            # boundary, so nothing below ts_new was ever fp8; same for a
+            # prefix-hit request (hit rows are never fp8).
+            if ts_old > 0 and ts_new > ts_old:
+                self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
             self._kvarn_tail_start[req_id] = ts_new
-            num_tokens_to_cache = min(num_tokens_to_cache, ts_new)
+            # Publish only whole pages that sit fully below the tail
+            # boundary: published blocks are uniformly kvarn, so prefix
+            # hits read consistent records.
+            num_tokens_to_cache = min(
+                num_tokens_to_cache,
+                (ts_new // block_size) * block_size,
+            )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
