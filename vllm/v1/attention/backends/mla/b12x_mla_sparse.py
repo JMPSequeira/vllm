@@ -1570,6 +1570,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         keys = [("decode", self._decode_max_rows), ("extend", self._max_tokens)]
         if self._uses_kvarn_cache and self._kvarn_tail_local_tokens > 0:
             keys.append(("extend_tail", self._max_tokens))
+            keys.append(("extend_tail_gather", self._max_tokens))
         if self._ckv_gather_enabled:
             keys.append(("ckv_extend", self._max_tokens))
         self._plans = {}
@@ -1609,7 +1610,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         segment: the KVARN_TAIL_FP8 arm (GLM fp8 math over 536B pool rows)
         attending the dense tail window.
         """
-        tail_mode = mode in ("decode_tail", "extend_tail")
+        tail_mode = mode in ("decode_tail", "extend_tail", "extend_tail_gather")
         caps_kwargs = dict(
             device=torch.device("cuda", torch.accelerator.current_device_index()),
             num_q_heads=(
@@ -1649,13 +1650,21 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 caps_kwargs.update(
                     model_type=int(self._module.ModelType.KVARN_TAIL_FP8),
                     scale_format=1,  # ScaleFormat.ARBITRARY_FP32 (GLM fp8)
-                    max_width=self._kvarn_tail_local_tokens,
+                    max_width=(
+                        self._kvarn_tail_tokens
+                        if mode == "extend_tail_gather"
+                        else self._kvarn_tail_local_tokens
+                    ),
                     cache_record_bytes=layout.record_bytes,
                     return_lse=True,
                     mode="decode",
                     num_q_heads=self._kernel_num_heads,
                     max_chunks_per_row=2,
                 )
+                if mode == "extend_tail_gather":
+                    # Binds the gathered arena: one KV page equals one tile
+                    # (group records), mirroring the body ckv_extend plan.
+                    caps_kwargs["page_size"] = int(layout.group)
             else:
                 caps_kwargs.update(
                     scale_format=3,  # ScaleFormat.KVARN_DUAL
@@ -2743,7 +2752,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         tail_active = (
             self._uses_kvarn_cache
             and self._kvarn_tail_local_tokens > 0
-            and not use_ckv_gather
             and ts is not None
         )
         if tail_active:
@@ -2946,40 +2954,79 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             n_local = self._kvarn_tail_local_tokens
             csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
             ts = getattr(attn_metadata, "kvarn_tail_start", None)
-            from vllm.v1.attention.backends.mla.kvarn_tail import (
-                kvarn_tail_local_row_start,
-            )
+            if use_ckv_gather:
+                # Gather route: global units throughout. The tail window is
+                # [boundary_global, csl) in GLOBAL positions; the same
+                # mapper the body uses converts them to gathered-arena rows.
+                # The arena keeps these rows fp8 (no gathered demote), and
+                # the body launch never sees them: the tail mask zeroed
+                # their topk selections above.
+                n_tail = self._kvarn_tail_tokens
+                cols = torch.arange(n_tail, device=csl.device)
+                pos = boundary_global[:, None] + cols[None, :]
+                valid = pos < cache_seq_lens[:, None]
+                pos = torch.where(
+                    valid, pos, torch.full((), -1, dtype=pos.dtype)
+                )
+                tail_indices = torch.empty(
+                    (num_tokens, n_tail),
+                    dtype=torch.int32,
+                    device=csl.device,
+                )
+                tail_lengths = torch.empty(
+                    (num_tokens,), dtype=torch.int32, device=csl.device
+                )
+                _map_global_topk_to_gathered_ckv(
+                    attn_metadata.req_id_per_token[:num_tokens],
+                    pos,
+                    attn_metadata.dcp_rank_req_starts,
+                    attn_metadata.dcp_rank_req_lens,
+                    tail_indices,
+                    tail_lengths,
+                    dcp_size=self.dcp_world_size,
+                    cp_kv_cache_interleave_size=(
+                        attn_metadata.cp_kv_cache_interleave_size
+                    ),
+                    padded_rank_tokens=attn_metadata.dcp_padded_total_tokens,
+                )
+                tail_plan = self._plan(
+                    ("extend_tail_gather", self._max_tokens)
+                )
+            else:
+                from vllm.v1.attention.backends.mla.kvarn_tail import (
+                    kvarn_tail_local_row_start,
+                )
 
-            boundary_local = kvarn_tail_local_row_start(
-                ts[:num_reqs],
-                self.dcp_rank,
-                self.dcp_world_size,
-                int(attn_metadata.cp_kv_cache_interleave_size),
-            )[req_ids.to(torch.int64)]
-            # Per-token local sequence length: rows are causal tokens, so
-            # each row's tail window ends at its OWN cache length (extend
-            # rows within a chunk have distinct, increasing S -- a
-            # request-max would let early rows attend future tokens).
-            s_local = csl
-            cols = torch.arange(n_local, device=csl.device)
-            pos = boundary_local[:, None] + cols[None, :]
-            valid = pos < s_local[:, None]
-            pos = torch.where(valid, pos, torch.zeros_like(pos))
-            tail_indices = kvarn_tail_positions_to_slots(
-                pos,
-                req_ids.unsqueeze(1).expand_as(pos),
-                attn_metadata.block_table,
-                attn_metadata.block_size,
-            ).to(torch.int32)
-            tail_indices = torch.where(
-                valid, tail_indices, torch.full((), -1, dtype=tail_indices.dtype, device=tail_indices.device)
-            )
-            tail_lengths = (s_local - boundary_local).clamp_(min=0).clamp_max_(n_local)
-            tail_plan = self._plan(
-                ("decode_tail", num_tokens)
-                if plan_key[0] == "decode"
-                else ("extend_tail", self._max_tokens)
-            )
+                boundary_local = kvarn_tail_local_row_start(
+                    ts[:num_reqs],
+                    self.dcp_rank,
+                    self.dcp_world_size,
+                    int(attn_metadata.cp_kv_cache_interleave_size),
+                )[req_ids.to(torch.int64)]
+                # Per-token local sequence length: rows are causal tokens, so
+                # each row's tail window ends at its OWN cache length (extend
+                # rows within a chunk have distinct, increasing S -- a
+                # request-max would let early rows attend future tokens).
+                s_local = csl
+                cols = torch.arange(n_local, device=csl.device)
+                pos = boundary_local[:, None] + cols[None, :]
+                valid = pos < s_local[:, None]
+                pos = torch.where(valid, pos, torch.zeros_like(pos))
+                tail_indices = kvarn_tail_positions_to_slots(
+                    pos,
+                    req_ids.unsqueeze(1).expand_as(pos),
+                    attn_metadata.block_table,
+                    attn_metadata.block_size,
+                ).to(torch.int32)
+                tail_indices = torch.where(
+                    valid, tail_indices, torch.full((), -1, dtype=tail_indices.dtype, device=tail_indices.device)
+                )
+                tail_lengths = (s_local - boundary_local).clamp_(min=0).clamp_max_(n_local)
+                tail_plan = self._plan(
+                    ("decode_tail", num_tokens)
+                    if plan_key[0] == "decode"
+                    else ("extend_tail", self._max_tokens)
+                )
             tail_binding = self._bind(
                 tail_plan,
                 scratch=scratch,
