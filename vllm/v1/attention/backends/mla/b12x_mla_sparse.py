@@ -1972,6 +1972,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             if include_ckv
             else self._scratch_nbytes
         )
+        if include_ckv and self._uses_kvarn_cache and self._kvarn_tail_local_tokens > 0:
+            # The extend tail launch runs the fp8 DECODE arm over the full
+            # extend row count: its split-K scratch is ~2x the MG body's.
+            # Size the shared scratch for the larger of the two, or the
+            # first tail-on prefill fails the bind-time scratch check.
+            tail_nbytes = int(
+                self._plan(("extend_tail_gather", self._max_tokens))
+                .scratch_specs()[0].nbytes
+            )
+            scratch_nbytes = max(scratch_nbytes, tail_nbytes)
         scratch_spec = ((scratch_nbytes,), torch.uint8)
         if self._uses_kvarn_cache:
             ckv_specs = (((self._ckv_gather_bytes(),), torch.uint8),)
