@@ -3047,7 +3047,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             # NaN LSE that poisons the merge: clamp to 1 candidate that is
             # fully masked (-1) -- its partials are the merge identity.
             tail_indices = torch.where(
-                tail_lengths > 0,
+                (tail_lengths > 0)[:, None],
                 tail_indices,
                 torch.full((), -1, dtype=tail_indices.dtype,
                            device=tail_indices.device),
