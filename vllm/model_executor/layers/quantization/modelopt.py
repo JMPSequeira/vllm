@@ -1558,7 +1558,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             codec = recipe.get("quant_algo", "").upper()
             scale_encoding = recipe.get("weight_scale_encoding")
             if scale_encoding is not None and (
-                scale_encoding != "csf"
+                scale_encoding not in ("csf", "csf_32x2_v1")
                 or codec not in ("NVFP4", "W4A16_NVFP4")
                 or recipe.get("group_size", 16) != 16
             ):
@@ -1582,7 +1582,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.mxfp8_config = mxfp8_config
         self.csf_state = None
         if any(
-            r.get("weight_scale_encoding") == "csf" for r in quantized_layers.values()
+            r.get("weight_scale_encoding") in ("csf", "csf_32x2_v1")
+            for r in quantized_layers.values()
         ):
             from .nvfp4_csf import Nvfp4CsfState
 
@@ -1847,13 +1848,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         quant_algo = self._resolve_quant_algo(prefix)
 
-        if self._resolve_weight_scale_encoding(prefix) == "csf":
+        if self._resolve_weight_scale_encoding(prefix) in ("csf", "csf_32x2_v1"):
             if not isinstance(layer, RoutedExperts):
                 raise ValueError("CSF scale encoding currently requires routed experts")
             from .nvfp4_csf import Nvfp4CsfMoEMethod
 
             return Nvfp4CsfMoEMethod(
-                layer.moe_config, self.csf_state, use_a16=quant_algo == "W4A16_NVFP4"
+                layer.moe_config,
+                self.csf_state,
+                use_a16=quant_algo == "W4A16_NVFP4",
+                encoding=self._resolve_weight_scale_encoding(prefix),
             )
 
         if quant_algo in ("IQ2_XS", "IQ2_XXS", "Q8_0"):
