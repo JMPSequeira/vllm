@@ -3049,10 +3049,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
             # A page-granular ts can sit at or above a row's S (the manager
             # publishes whole pages below S-N, so the fp8 window is empty
-            # whenever the last partial page is kvarn). An empty window must
-            # still launch with >=1 candidate or the arm's softmax yields a
-            # NaN LSE that poisons the merge: clamp to 1 candidate that is
-            # fully masked (-1) -- its partials are the merge identity.
+            # whenever the last partial page is kvarn; with N < page that is
+            # most decode steps). The launch must stay shape-static and
+            # capture-safe, but the kernel only skips candidates BEYOND
+            # selected_lengths -- a -1 within the count is scored from stale
+            # smem. So: launch a 1-candidate -1 dummy, then REPLACE the
+            # merged partials with the body's for empty rows (branchless,
+            # tensor-select). The body = the exact identity for those rows.
+            tail_lens_real = tail_lengths.clone()
             tail_indices = torch.where(
                 (tail_lengths > 0)[:, None],
                 tail_indices,
@@ -3078,9 +3082,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 tail_result if isinstance(tail_result, tuple) else (tail_result, None)
             )
             assert body_lse is not None and tail_lse is not None
-            output = merge_tail_lse(tail_output, tail_lse, body_output, body_lse)
+            merged = merge_tail_lse(tail_output, tail_lse, body_output, body_lse)
+            empty_row = (tail_lens_real == 0)[:, None, None]
+            output = torch.where(empty_row, body_output, merged)
             lse = (
-                torch.logaddexp(tail_lse.float(), body_lse.float()).to(tail_lse.dtype)
+                torch.where(
+                    (tail_lens_real == 0)[:, None],
+                    body_lse.float(),
+                    torch.logaddexp(tail_lse.float(), body_lse.float()),
+                ).to(tail_lse.dtype)
                 if self.need_to_return_lse_for_decode
                 else None
             )
