@@ -2944,6 +2944,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 ),
                 flush=True,
             )
+        full_cache_lens = cache_seq_lens
+        if tail_active and plan_key[0] != "decode":
+            # The MG extend body is DENSE over cache_lengths: with fp8 tail
+            # rows in the pool/arena it must stop at the tail boundary or it
+            # dequantizes fp8 records as kvarn (the lock-loop signature).
+            # The tail launch keeps the unclamped length as its window end.
+            cache_seq_lens = torch.minimum(cache_seq_lens, boundary_global)
         binding = self._bind(
             plan,
             scratch=scratch,
@@ -3059,7 +3066,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 q=q_all,
                 kv_cache=kv_cache_for_run,
                 selected_indices=tail_indices,
-                cache_lengths=cache_seq_lens,
+                cache_lengths=full_cache_lens,
                 selected_lengths=tail_lengths,
             )
             # The body launch's output may alias the shared kernel scratch;
