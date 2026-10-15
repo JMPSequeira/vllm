@@ -2212,11 +2212,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             arena.view(tiles, tile_tokens * record).copy_(
                 staging[:used_rows].view(tiles, tile_tokens * record)
             )
-            # The per-tile tail carries no data but sits inside the tile
-            # stride the kernel's C4-page-granular IO touches; stale
-            # workspace bytes there dequantize into garbage scales for
-            # later tiles. Zero it every gather (tiles x 6.4 KB).
-            gathered_buffer[staging_bytes:].as_strided(
+            if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+                self._dbg_postcopy = arena.reshape(-1, record)[:24].clone()
+            # The per-tile tail sits AFTER the tile's records (tile_base +
+            # tile_tokens*record .. +tile_stride); zero it every gather so
+            # stale workspace bytes never dequantize into garbage scales.
+            gathered_buffer[
+                staging_bytes + tile_tokens * record:
+            ].as_strided(
                 (tiles, tile_stride - tile_tokens * record),
                 (tile_stride, 1),
             ).zero_()
