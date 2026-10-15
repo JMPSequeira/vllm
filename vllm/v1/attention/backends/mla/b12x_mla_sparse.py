@@ -2325,7 +2325,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             num_tokens = slots.shape[0]
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
             demote_ranges = getattr(attn_metadata, "kvarn_tail_demote_ranges", None)
-            csl = attn_metadata.cache_seq_lens_per_token[:num_tokens]
+            # The fp8 test is in GLOBAL request-relative units: ts is the
+            # manager's global boundary and cache_seq_lens_per_token is
+            # DCP-LOCAL -- comparing them never fired fp8 stores on DCP>1,
+            # leaving the pool all-kvarn while the tail launch read the
+            # masked range as fp8. positions are global and 0-based, and
+            # the design's rule is fp8 iff pos >= ts.
+            pos_g = attn_metadata.global_positions
+            if pos_g is None:
+                pos_g = attn_metadata.cache_seq_lens_per_token[:num_tokens] - 1
+            else:
+                pos_g = pos_g[:num_tokens]
             ts = getattr(attn_metadata, "kvarn_tail_start", None)
             if ts is None:
                 boundary = None
@@ -2339,7 +2349,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 tail_slots = slots.new_full(slots.shape, -1)
                 body_slots = slots
             else:
-                is_tail = (csl - 1) >= boundary
+                is_tail = pos_g >= boundary
                 tail_slots = torch.where(
                     is_tail.bool(), slots, slots.new_full((), -1)
                 )
