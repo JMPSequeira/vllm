@@ -2326,16 +2326,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             req_ids = attn_metadata.req_id_per_token[:num_tokens]
             demote_ranges = getattr(attn_metadata, "kvarn_tail_demote_ranges", None)
             # The fp8 test is in GLOBAL request-relative units: ts is the
-            # manager's global boundary and cache_seq_lens_per_token is
-            # DCP-LOCAL -- comparing them never fired fp8 stores on DCP>1,
-            # leaving the pool all-kvarn while the tail launch read the
-            # masked range as fp8. positions are global and 0-based, and
-            # the design's rule is fp8 iff pos >= ts.
-            pos_g = attn_metadata.global_positions
-            if pos_g is None:
-                pos_g = attn_metadata.cache_seq_lens_per_token[:num_tokens] - 1
+            # manager's global boundary and the rope positions are the
+            # rank's DCP-LOCAL sequence positions (0..local_len). Convert
+            # local -> global through the DCP interleave -- the exact
+            # inverse of the gather mapper's ownership rule
+            # (owner = g//I % ws, local_idx = (g//(ws*I))*I + g%I).
+            pos_l = attn_metadata.global_positions
+            if pos_l is None:
+                pos_l = attn_metadata.cache_seq_lens_per_token[:num_tokens] - 1
             else:
-                pos_g = pos_g[:num_tokens]
+                pos_l = pos_l[:num_tokens]
+            ws = self.dcp_world_size
+            itl = int(attn_metadata.cp_kv_cache_interleave_size)
+            pos_g = (
+                (pos_l // itl) * (ws * itl)
+                + self.dcp_rank * itl
+                + (pos_l % itl)
+            )
             ts = getattr(attn_metadata, "kvarn_tail_start", None)
             if ts is None:
                 boundary = None
