@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-glm53-kda-mixed-w8a16",
+  "category": "feature",
+  "summary": "GLM-5.3-Flash loads checkpoints with mixed-format KDA projections and can run its MXFP8 KDA projections with BF16 activations",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required. VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE defaults to auto, which keeps the previous behavior.",
+  "details": [
+    "Checkpoints that store KDA q/k/v in MXFP8 or block FP8 and b_proj/f_a_proj in BF16 now load; KDA then runs q|k|v and b|f_a as two GEMMs. Uniform checkpoints keep the fused projection. Block-FP8 kv_b is dequantized directly from its scales.",
+    "VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE=a16 runs the MXFP8 KDA projections with BF16 activations for every call; prefill does so for calls of at least 128 rows and keeps W8A8 for shorter calls.",
+    "With the official BF16 KDA gates, indexer and kv_b and W8A16 KDA q/k/v/o, a 516K-token long-context lookup test reaches 79.6% vs 76.5% with W8A8. The FlashInfer B12X A16 MXFP8 fix keeps the extra prefill cost near 1%."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    1027
+  ],
+  "requires": []
+}
