@@ -2209,6 +2209,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             arena.view(tiles, tile_tokens * record).copy_(
                 staging[:used_rows].view(tiles, tile_tokens * record)
             )
+            # The per-tile tail carries no data but sits inside the tile
+            # stride the kernel's C4-page-granular IO touches; stale
+            # workspace bytes there dequantize into garbage scales for
+            # later tiles. Zero it every gather (tiles x 6.4 KB).
+            gathered_buffer[staging_bytes:].as_strided(
+                (tiles, tile_stride - tile_tokens * record),
+                (tile_stride, 1),
+            ).zero_()
             return arena
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
