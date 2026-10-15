@@ -200,6 +200,11 @@ class KVCacheManager:
         # reproduces the stock caching behavior exactly.
         self.kvarn_tail_tokens = int(kvarn_tail_tokens)
         self._kvarn_tail_start: dict[str, int] = {}
+        # The sequence length when ts was last set: the fp8 rows under the
+        # current ts are exactly [ts, S_at_set) -- the window of the chunk
+        # that established it. The demotion of a superseded ts must stop
+        # there, or it requantizes later chunks' kvarn rows as fp8.
+        self._kvarn_tail_ts_since: dict[str, int] = {}
         self._kvarn_tail_demotions: list[tuple[str, int, int]] = []
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
@@ -810,6 +815,7 @@ class KVCacheManager:
             req_id = request.request_id
             block_size = self.coordinator.single_type_managers[0].block_size
             ts_old = self._kvarn_tail_start.get(req_id, 0)
+            ts_since = self._kvarn_tail_ts_since.get(req_id, 0)
             ts_new = max(
                 num_tokens_to_cache - self.kvarn_tail_tokens,
                 ts_old,
@@ -826,9 +832,12 @@ class KVCacheManager:
             # allocation ts_old=0 but the chunk was stored under the NEW
             # boundary, so nothing below ts_new was ever fp8; same for a
             # prefix-hit request (hit rows are never fp8).
-            if ts_old > 0 and ts_new > ts_old:
-                self._kvarn_tail_demotions.append((req_id, ts_old, ts_new))
+            if ts_old > 0:
+                hi = min(ts_new, ts_since)
+                if hi > ts_old:
+                    self._kvarn_tail_demotions.append((req_id, ts_old, hi))
             self._kvarn_tail_start[req_id] = ts_new
+            self._kvarn_tail_ts_since[req_id] = num_tokens_to_cache
             # Publish only whole pages that sit fully below the tail
             # boundary: published blocks are uniformly kvarn, so prefix
             # hits read consistent records.
