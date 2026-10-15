@@ -1650,6 +1650,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 caps_kwargs.update(
                     model_type=int(self._module.ModelType.KVARN_TAIL_FP8),
                     scale_format=1,  # ScaleFormat.ARBITRARY_FP32 (GLM fp8)
+                    kvarn_k_bits=layout.k_bits,
+                    kvarn_v_bits=layout.v_bits,
+                    kvarn_group=layout.group,
                     max_width=(
                         self._kvarn_tail_tokens
                         if mode == "extend_tail_gather"
@@ -2967,7 +2970,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 valid = pos < cache_seq_lens[:, None]
                 pos = torch.where(
                     valid, pos, torch.full((), -1, dtype=pos.dtype)
-                )
+                ).to(torch.int32)
                 tail_indices = torch.empty(
                     (num_tokens, n_tail),
                     dtype=torch.int32,
