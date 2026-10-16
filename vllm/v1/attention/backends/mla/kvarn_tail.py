@@ -205,9 +205,14 @@ def _kvarn_tail_demote_ranges_kernel(
     end = tl.minimum(hi, start + CHUNK)
 
     # Ranges are GLOBAL request-relative positions; the pool block table
-    # maps LOCAL rows (this rank's owned records) to slots. Convert both
-    # endpoints to local row indices (see kvarn_tail_local_row_start).
-    t_lo = tl.maximum(lo - DCP_RANK * INTERLEAVE, 0)
+    # maps LOCAL rows (this rank's owned records) to slots. Convert this
+    # chunk's OWN global slice endpoints to local row indices (see
+    # kvarn_tail_local_row_start). The chunk offset must come from the
+    # global slice start -- re-deriving it as j_lo + chunk*CHUNK applies
+    # the global stride in local space, where rows advance at 1/DCP_SIZE
+    # the rate, so every chunk past the first exits early and the window
+    # is left partially fp8 (corrupts the kvarn body reader).
+    t_lo = tl.maximum(start - DCP_RANK * INTERLEAVE, 0)
     j_lo = (t_lo // (INTERLEAVE * DCP_SIZE)) * INTERLEAVE + tl.minimum(
         t_lo % (INTERLEAVE * DCP_SIZE), INTERLEAVE
     )
@@ -215,12 +220,11 @@ def _kvarn_tail_demote_ranges_kernel(
     j_hi = (t_hi // (INTERLEAVE * DCP_SIZE)) * INTERLEAVE + tl.minimum(
         t_hi % (INTERLEAVE * DCP_SIZE), INTERLEAVE
     )
-    start_j = j_lo + chunk * CHUNK
-    if start_j >= j_hi:
+    if j_lo >= j_hi:
         return
-    end_j = tl.minimum(j_hi, start_j + CHUNK)
+    end_j = j_hi
 
-    for pos in range(start_j, end_j):
+    for pos in range(j_lo, end_j):
         blk = tl.load(block_table_ptr + req.to(tl.int64) * max_blocks + pos // BLOCK_SIZE)
         slot = blk * BLOCK_SIZE + pos % BLOCK_SIZE
         base = (
@@ -270,8 +274,11 @@ def kvarn_tail_demote_ranges(
     if num_reqs == 0:
         return
     # Each request's range is bounded by (tokens scheduled this step +
-    # one block); CHUNK slices cover it with a static grid.
-    chunks = (num_tokens + block_size - 1) // block_size + 1
+    # one block); CHUNK slices cover it with a static grid. The count
+    # must span the GLOBAL range at CHUNK granularity -- sizing it by
+    # block_size leaves the range's tail slices without a program, so
+    # those rows stay fp8. Excess programs early-exit (start >= hi).
+    chunks = (num_tokens + block_size + 255) // 256
     grid = (num_reqs, chunks)
     _kvarn_tail_demote_ranges_kernel[grid](
         kv_cache,
