@@ -2524,24 +2524,41 @@ class GPUModelRunner(
         kvarn_tail_demote_ranges = None
         kvarn_tail_starts = getattr(self, "_kvarn_tail_starts_step", None) or {}
         if kvarn_tail_starts:
-            kvarn_tail_start = torch.zeros(
-                num_reqs_padded, dtype=torch.int32, device=self.device
-            )
-            kvarn_tail_demote_ranges = torch.zeros(
-                num_reqs_padded, 2, dtype=torch.int32, device=self.device
-            )
+            # Persistent, in-place-updated staging. A FULL CUDA graph binds
+            # the capture-time tensor address, so a fresh per-step tensor is
+            # either frozen after the allocator recycles it or, under async
+            # scheduling, racy against a still-pending replay. The body's
+            # inputs follow the same persistent-buffer contract.
+            if getattr(self, "_kvarn_tail_start_buf", None) is None:
+                max_reqs = self.scheduler_config.max_num_seqs
+                self._kvarn_tail_start_buf = torch.zeros(
+                    max_reqs, dtype=torch.int32, device=self.device
+                )
+                self._kvarn_tail_demote_ranges_buf = torch.zeros(
+                    max_reqs, 2, dtype=torch.int32, device=self.device
+                )
+            self._kvarn_tail_start_buf.zero_()
+            self._kvarn_tail_demote_ranges_buf.zero_()
             req_index = self.input_batch.req_id_to_index
             for req_id, ts in kvarn_tail_starts.items():
                 idx = req_index.get(req_id)
-                if idx is not None and idx < num_reqs_padded:
-                    kvarn_tail_start[idx] = ts
+                if (
+                    idx is not None
+                    and idx < self._kvarn_tail_start_buf.shape[0]
+                ):
+                    self._kvarn_tail_start_buf[idx] = ts
             for req_id, (lo, hi) in (
                 getattr(self, "_kvarn_tail_demotions_step", None) or {}
             ).items():
                 idx = req_index.get(req_id)
-                if idx is not None and idx < num_reqs_padded:
-                    kvarn_tail_demote_ranges[idx, 0] = lo
-                    kvarn_tail_demote_ranges[idx, 1] = hi
+                if (
+                    idx is not None
+                    and idx < self._kvarn_tail_demote_ranges_buf.shape[0]
+                ):
+                    self._kvarn_tail_demote_ranges_buf[idx, 0] = lo
+                    self._kvarn_tail_demote_ranges_buf[idx, 1] = hi
+            kvarn_tail_start = self._kvarn_tail_start_buf
+            kvarn_tail_demote_ranges = self._kvarn_tail_demote_ranges_buf
 
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],

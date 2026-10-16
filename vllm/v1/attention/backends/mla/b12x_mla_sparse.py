@@ -1039,10 +1039,14 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
         elif common.max_query_len <= 1 and num_tokens == common.num_reqs:
             per_token_lens = seq_lens[:num_tokens]
-        elif not use_dcp and common.positions is not None:
-            # The decode kernel binds these lengths, so they must live in the
-            # builder's buffer: a FULL CUDA graph captures the buffer address
-            # and replays against whatever a later build wrote there.
+        elif common.positions is not None and not common.is_prefilling:
+            # Decode rows (incl. DCP): derive the per-token cache length as
+            # local position + 1 entirely on-device. Stream-ordered, so it is
+            # safe under async scheduling, and this buffer's address is what
+            # a captured FULL graph replays against. The CPU-staged fallback
+            # below rewrites its pinned source on every build, which races a
+            # still-pending replay under async scheduling -- fatal for the
+            # kvarn tail, whose dense window consumes every length.
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
             per_token_lens.copy_(common.positions[:num_tokens])
             per_token_lens += 1
