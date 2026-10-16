@@ -80,6 +80,11 @@ _GLM_DSA_NVFP4_CACHE_RECORD_BYTES = 368
 
 logger = init_logger(__name__)
 
+# KVARN_TAIL_HASH diagnostic: running checksums of the decode-tail bindings,
+# written by the captured tail branch each replay and read from the per-step
+# metadata build (which runs outside any captured region).
+_KVTAIL_HASH_BUF: torch.Tensor | None = None
+
 
 def _kvarn_dbg_save(obj, path):
     # torch.save straight to a path races when both DCP ranks save
@@ -1219,6 +1224,30 @@ class B12xMLASparseMetadataBuilder(
         selector_num_accepted_tokens: torch.Tensor | None = None,
         selector_is_prefilling: torch.Tensor | None = None,
     ) -> B12xMLASparseMetadata:
+        if (
+            os.environ.get("KVARN_TAIL_HASH") == "1"
+            and common_attn_metadata.num_actual_tokens <= 32
+        ):
+            _hb = globals().get("_KVTAIL_HASH_BUF")
+            if _hb is not None:
+                try:
+                    with open(
+                        "/home/js/kvarn-probes/kvtailbuild-r0.log", "a"
+                    ) as _f:
+                        _f.write(
+                            "replay=%d idx_sum=%d len_sum=%d csl_sum=%d "
+                            "build_csl_sum=%d nt=%d\n"
+                            % (
+                                int(_hb[3].item()),
+                                int(_hb[0].item()),
+                                int(_hb[1].item()),
+                                int(_hb[2].item()),
+                                int(common_attn_metadata.query_start_loc[-1].item()),
+                                int(common_attn_metadata.query_start_loc.numel() - 1),
+                            )
+                        )
+                except OSError:
+                    pass
         return self._build(
             common_prefix_len,
             common_attn_metadata,
@@ -2650,6 +2679,43 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         logger.warning("KVARN_TAIL_DEBUG: pool dump saved")
                     except Exception as _e:
                         logger.warning("KVARN_TAIL_DEBUG: pool dump failed %s", _e)
+            if (
+                os.environ.get("KVARN_TAIL_HASH") == "1"
+                and getattr(self, "_kvarn_tail_indices_buffer", None) is not None
+                and num_tokens <= self._decode_max_rows
+                and self.dcp_rank == 0
+                and attn_metadata.num_prefills == 0
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                # Per-step checksum of the decode-tail bindings. The writer
+                # dispatch runs eagerly per step, so after each graph replay
+                # this shows whether the captured copy kernels recomputed the
+                # persistent tail buffers from live metadata (hash varies
+                # with csl/ts) or the replay froze them.
+                _tib = self._kvarn_tail_indices_buffer[:num_tokens]
+                _tlb = self._kvarn_tail_lengths_buffer[:num_tokens]
+                _csl_t = attn_metadata.cache_seq_lens_per_token[:num_tokens]
+                try:
+                    with open(
+                        f"/home/js/kvarn-probes/kvtailhash-r{self.dcp_rank}.log",
+                        "a",
+                    ) as _f:
+                        _f.write(
+                            "nt=%d idx_sum=%d len_sum=%d csl_sum=%d ts_sum=%s\n"
+                            % (
+                                num_tokens,
+                                int(_tib.sum().item()),
+                                int(_tlb.sum().item()),
+                                int(_csl_t.sum().item()),
+                                (
+                                    int(ts.sum().item())
+                                    if ts is not None
+                                    else -1
+                                ),
+                            )
+                        )
+                except OSError:
+                    pass
             return
         if self._uses_glm_dsa_nvfp4_cache:
             if kv_cache.numel() == 0:
@@ -3589,6 +3655,24 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 self._kvarn_tail_lengths_buffer[:num_tokens].copy_(tail_lengths)
                 tail_indices = self._kvarn_tail_indices_buffer[:num_tokens]
                 tail_lengths = self._kvarn_tail_lengths_buffer[:num_tokens]
+                if os.environ.get("KVARN_TAIL_HASH") == "1":
+                    global _KVTAIL_HASH_BUF
+                    if _KVTAIL_HASH_BUF is None:
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError(
+                                "KVTAILHASH buffer must be allocated eagerly"
+                            )
+                        _KVTAIL_HASH_BUF = torch.zeros(
+                            4, dtype=torch.int64, device=tail_indices.device
+                        )
+                    _KVTAIL_HASH_BUF[0].copy_(
+                        tail_indices.to(torch.int64).sum()
+                    )
+                    _KVTAIL_HASH_BUF[1].copy_(
+                        tail_lengths.to(torch.int64).sum()
+                    )
+                    _KVTAIL_HASH_BUF[2].copy_(csl.to(torch.int64).sum())
+                    _KVTAIL_HASH_BUF[3] += 1
             if os.environ.get("KVARN_TAIL_PRIVATE_KV") == "1":
                 # Decisive fork test: bind the tail launch to a private copy
                 # of the arena (same shape/stride). If the canary passes, the
