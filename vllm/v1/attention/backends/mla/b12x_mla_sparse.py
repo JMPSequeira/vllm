@@ -81,6 +81,33 @@ _GLM_DSA_NVFP4_CACHE_RECORD_BYTES = 368
 logger = init_logger(__name__)
 
 
+def _kvarn_dbg_save(obj, path):
+    # torch.save straight to a path races when both DCP ranks save
+    # simultaneously (zip-writer "unexpected pos" corruption); serialize
+    # in memory and rename atomically instead.
+    import io
+    _buf = io.BytesIO()
+    torch.save(obj, _buf)
+    _tmp = f"{path}.tmp{os.getpid()}"
+    with open(_tmp, "wb") as _f:
+        _f.write(_buf.getvalue())
+    os.replace(_tmp, path)
+
+
+def _kvarn_force_sync():
+    # KVARN_TAIL_FORCE_SYNC=1: hard barrier at every stage boundary to
+    # test whether the tail poison is an async-ordering race (passes
+    # canary => race; still fails => structural). Skipped under CUDA
+    # graph capture (synchronize is illegal there; the captured decode
+    # path is same-stream ordered anyway, and the failing extend path
+    # is eager).
+    if (
+        os.environ.get("KVARN_TAIL_FORCE_SYNC") == "1"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        torch.cuda.synchronize()
+
+
 @runtime_checkable
 class B12xPhysicalSelectionProvider(Protocol):
     def get_b12x_physical_selection(
@@ -1527,6 +1554,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             max_tokens,
             max_seqs * self._max_speculative_decode_query_len,
         )
+        if self._uses_kvarn_cache and self._kvarn_tail_local_tokens > 0:
+            # The decode-tail launch consumes these under captured decode
+            # graphs, so they must be persistent buffers (same contract as
+            # ckv_selected_indices_buffer): the per-step computed temporaries
+            # are copied in before every launch, and the bind always sees a
+            # capture-stable address.
+            _tail_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+            self._kvarn_tail_indices_buffer = torch.empty(
+                (self._decode_max_rows, self._kvarn_tail_local_tokens),
+                dtype=torch.int32,
+                device=_tail_dev,
+            )
+            self._kvarn_tail_lengths_buffer = torch.empty(
+                (self._decode_max_rows,),
+                dtype=torch.int32,
+                device=_tail_dev,
+            )
         self._kv_dtype = torch.uint8
         kernel_page_size = (
             int(vllm_config.cache_config.block_size) if self._is_glm_next else 64
@@ -2369,13 +2413,49 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             self._concat_and_cache_glm_next_mla_kvarn(
                 kv_c_normed, kv_cache, body_slots, plan=plan
             )
+            _kvarn_force_sync()
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and slots.shape[0] > 1000
+            ):
+                try:
+                    _sl_seq = globals().get("_KVAR_DBG_SEQ", 0)
+                    if _sl_seq <= 12:
+                        torch.cuda.synchronize()
+                        _pr = list(range(760, 790)) + list(range(1520, 1570))
+                        _bs = body_slots[_pr].to(torch.int64)
+                        _tsl = tail_slots[_pr].to(torch.int64)
+                        _kc = (
+                            kv_cache.view(torch.uint8)
+                            if kv_cache.dtype == torch.float8_e4m3fn
+                            else kv_cache
+                        )
+                        _prec = {}
+                        for _i, _s in enumerate(_bs.tolist()):
+                            if _s >= 0:
+                                _prec[_pr[_i]] = _kc[
+                                    _s // _kc.shape[1], _s % _kc.shape[1]
+                                ].cpu().clone()
+                        _kvarn_dbg_save(
+                            {
+                                "rank": self.dcp_rank,
+                                "seq": _sl_seq,
+                                "slots": _bs.cpu(),
+                                "tail_slots": _tsl.cpu(),
+                                "pool_recs": _prec,
+                                "latents": kv_c_normed[_pr].detach().clone().cpu(),
+                            },
+                            f"/home/js/kvarn-probes/kvarn-stage{_sl_seq}-poststore-r{self.dcp_rank}.pt",
+                        )
+                except Exception as _e:
+                    logger.warning("stage store probe failed %s", _e)
             if demote_ranges is not None:
                 _dbg_demote = None
                 if (
                     os.environ.get("KVARN_TAIL_DEBUG")
                     and not torch.cuda.is_current_stream_capturing()
                     and not os.path.exists(
-                        f"/tmp/kvarn-demote-capture-r{self.dcp_rank}.pt"
+                        f"/home/js/kvarn-probes/kvarn-demote-capture-r{self.dcp_rank}.pt"
                     )
                 ):
                     _dr = demote_ranges[: attn_metadata.num_reqs]
@@ -2457,7 +2537,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 if _slots is None
                                 else kv_cache.reshape(-1, _rec)[_slots].clone()
                             )
-                        torch.save(
+                        _kvarn_dbg_save(
                             {
                                 "ranges": _dr,
                                 "jlo": _jlo,
@@ -2471,7 +2551,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                     attn_metadata.cp_kv_cache_interleave_size
                                 ),
                             },
-                            f"/tmp/kvarn-demote-capture-r{self.dcp_rank}.pt",
+                            f"/home/js/kvarn-probes/kvarn-demote-capture-r{self.dcp_rank}.pt",
                         )
                         logger.warning("KVARN_TAIL_DEBUG: demote capture saved")
                     except Exception as _e:
@@ -2519,7 +2599,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     boundary is not None
                     and int(boundary.max()) > 0
                     and not os.path.exists(
-                        f"/tmp/kvarn-pool-dump-r{self.dcp_rank}.pt"
+                        f"/home/js/kvarn-probes/kvarn-pool-dump-r{self.dcp_rank}.pt"
                     )
                     and attn_metadata.num_prefills > 0
                 ):
@@ -2546,7 +2626,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 _prow[_g] = kv_cache.reshape(-1, self._cache_record_bytes)[
                                     int(slots[_t])
                                 ].clone()
-                        torch.save(
+                        _kvarn_dbg_save(
                             {
                                 "rank": self.dcp_rank,
                                 "rows_by_global": _prow,
@@ -2565,7 +2645,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                     else None
                                 ),
                             },
-                            f"/tmp/kvarn-pool-dump-r{self.dcp_rank}.pt",
+                            f"/home/js/kvarn-probes/kvarn-pool-dump-r{self.dcp_rank}.pt",
                         )
                         logger.warning("KVARN_TAIL_DEBUG: pool dump saved")
                     except Exception as _e:
@@ -2688,6 +2768,76 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
         if local_tokens < padded_tokens:
             local_buffer[local_tokens:padded_tokens].zero_()
+        if (
+            os.environ.get("KVARN_TAIL_QPROBE") == "1"
+            and attn_metadata.num_actual_tokens > 1000
+        ):
+            try:
+                _gl_seq = globals().get("_KVAR_DBG_SEQ", 0)
+                if _gl_seq <= 12:
+                    torch.cuda.synchronize()
+                    _gl_rows = list(range(760, 790))
+                    _bt = attn_metadata.block_table[: attn_metadata.num_reqs, :8]
+                    _cu = attn_metadata.dcp_local_cu_seq_lens[
+                        : attn_metadata.num_reqs + 1
+                    ]
+                    _kcache_u8 = (
+                        kv_cache.view(torch.uint8)
+                        if kv_cache.dtype == torch.float8_e4m3fn
+                        else kv_cache
+                    )
+                    _psz = _kcache_u8.shape[1]
+                    _ref = {}
+                    for _r in _gl_rows:
+                        if _r >= int(_cu[1]):
+                            continue
+                        _pg = int(_bt[0, _r // _psz])
+                        _ref[_r] = (
+                            _kcache_u8[_pg, _r % _psz].cpu().clone()
+                            if _pg >= 0
+                            else None
+                        )
+                    _kvarn_dbg_save(
+                        {
+                            "rank": group.rank_in_group,
+                            "seq": _gl_seq,
+                            "rows_idx": _gl_rows,
+                            "rows": local_buffer[_gl_rows].cpu().contiguous(),
+                            "local_tokens": int(local_tokens),
+                            "padded": int(padded_tokens),
+                            "block_table_head": _bt.cpu(),
+                            "cu_seq_lens": _cu.cpu(),
+                            "ref_rows": _ref,
+                            "pool_shape": tuple(_kcache_u8.shape),
+                        },
+                        f"/home/js/kvarn-probes/kvarn-stage{_gl_seq}-postgatherlocal-r{group.rank_in_group}.pt",
+                    )
+            except Exception as _e:
+                logger.warning("stage postgatherlocal probe failed %s", _e)
+        if os.environ.get("KVARN_TAIL_DEBUG") and (
+            50_000_000 < gathered_buffer.numel() < 100_000_000
+            and not os.path.exists(f"/home/js/kvarn-probes/kvarn-prexchg-{os.getpid()}.pt")
+        ):
+            # Split gather-vs-exchange: the dense gather's output before the
+            # NCCL all-gather. LOGICAL rows of the tile-strided arena.
+            try:
+                _pr = [760 + i for i in range(20)]
+                _lb = local_buffer.reshape(-1)
+                _mine = torch.stack(
+                    [_lb[r * 536: r * 536 + 536] for r in _pr]
+                ).contiguous()
+                _kvarn_dbg_save(
+                    {
+                        "rank": group.rank_in_group,
+                        "pid": os.getpid(),
+                        "rows": _mine.cpu(),
+                        "local_tokens": int(local_tokens),
+                        "padded": int(padded_tokens),
+                    },
+                    f"/home/js/kvarn-probes/kvarn-prexchg-{os.getpid()}.pt",
+                )
+            except Exception as _e:
+                logger.warning("prexchg probe failed %s", _e)
         if os.environ.get("KVARN_GATHER_DEBUG") == "1" and local_tokens:
             # Torch-side reference gather: pool rows via block_table, in
             # local order. Diffs against what cp_gather_cache produced.
@@ -2760,6 +2910,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             local_buffer[:padded_tokens].view(-1),
             staging[: self.dcp_world_size * padded_tokens].view(-1),
         )
+        _kvarn_force_sync()
         if self._kvarn_tail_local_tokens > 0:
             # KVarN precision tail: rows stored as fp8 (positions >= ts)
             # STAY fp8 in the gathered copy — the extend tail launch reads
@@ -2841,17 +2992,18 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             arena.view(tiles, tile_tokens * record).copy_(
                 staging[:used_rows].view(tiles, tile_tokens * record)
             )
+            _kvarn_force_sync()
             if (
                 os.environ.get("KVARN_TAIL_DEBUG")
                 and not os.path.exists(
-                    f"/tmp/kvarn-stg-dump-r{group.rank_in_group}.pt"
+                    f"/home/js/kvarn-probes/kvarn-stg-dump-r{group.rank_in_group}.pt"
                 )
             ):
                 _ts_g = getattr(attn_metadata, "kvarn_tail_start", None)
                 if _ts_g is not None and int(_ts_g.max()) > 0:
                     try:
                         _probe = list(range(760, 780))
-                        torch.save(
+                        _kvarn_dbg_save(
                             {
                                 "rank": group.rank_in_group,
                                 "pid": os.getpid(),
@@ -2873,7 +3025,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 "tile_stride": tile_stride,
                                 "record": record,
                             },
-                            f"/tmp/kvarn-stg-dump-r{group.rank_in_group}.pt",
+                            f"/home/js/kvarn-probes/kvarn-stg-dump-r{group.rank_in_group}.pt",
                         )
                         logger.warning("KVARN_TAIL_DEBUG: staging dump saved")
                     except Exception as _e:
@@ -2891,21 +3043,26 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             ).zero_()
             if (
                 os.environ.get("KVARN_TAIL_DEBUG")
-                and not os.path.exists(f"/tmp/kvarn-postzero-{os.getpid()}.pt")
+                and attn_metadata.num_actual_tokens > 1000
+                and arena.shape[0] * 256 >= 2048
             ):
                 try:
-                    _ar2 = arena.reshape(-1, record)
-                    _pr = list(range(760, 780)) + list(range(2810, 2830))
-                    torch.save(
-                        {
-                            "rank": group.rank_in_group,
-                            "pid": os.getpid(),
-                            "rows": _ar2[_pr].cpu(),
-                        },
-                        f"/tmp/kvarn-postzero-{os.getpid()}.pt",
-                    )
+                    _pz_seq = globals().get("_KVAR_DBG_SEQ", 0)
+                    if _pz_seq <= 12:
+                        torch.cuda.synchronize()
+                        _ar2 = arena.reshape(-1, record)
+                        _rows = list(range(760, 790)) + list(range(2810, 2830))
+                        _kvarn_dbg_save(
+                            {
+                                "rank": group.rank_in_group,
+                                "seq": _pz_seq,
+                                "rows_idx": _rows,
+                                "rows": _ar2[_rows].cpu().contiguous(),
+                            },
+                            f"/home/js/kvarn-probes/kvarn-stage{_pz_seq}-postgather-r{group.rank_in_group}.pt",
+                        )
                 except Exception as _e:
-                    logger.warning("postzero probe failed %s", _e)
+                    logger.warning("stage postgather probe failed %s", _e)
             return arena
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
@@ -2951,6 +3108,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         q_all = q_buffer[:num_tokens]
         q_real = q_all[:, :input_num_heads]
+        if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
+            # One-shot per-rank capture: the MODEL's q before staging and the
+            # workspace q after it, plus segment pointers. Distinguishes
+            # model-side NaN from workspace-side corruption.
+            _qp = f"/home/js/kvarn-probes/kvarn-qprobe-r{self.dcp_rank}.pt"
+            if not os.path.exists(_qp):
+                try:
+                    _src = q[0] if isinstance(q, tuple) else q
+                    torch.cuda.synchronize()
+                    _model_q = _src[-8:].detach().clone().cpu()
+                    _qa_ptr = int(q_all.data_ptr())
+                    _qs_ptr = int(q_buffer.data_ptr())
+                    _sc_ptr = int(scratch.data_ptr()) if scratch is not None else -1
+                    _ck_ptr = int(workspaces[2].data_ptr()) if len(workspaces) > 2 else -1
+                except Exception as _e:
+                    logger.warning("KVARN_TAIL_QPROBE pre-stage failed %s", _e)
         if isinstance(q, tuple):
             q_nope, q_pe = q
             if int(q_pe.shape[-1]) == 0:
@@ -2971,6 +3144,26 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 q_real.copy_(q)
         if kernel_num_heads != input_num_heads:
             q_all[:, input_num_heads:].zero_()
+
+        if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
+            _qp = f"/home/js/kvarn-probes/kvarn-qprobe-r{self.dcp_rank}.pt"
+            if not os.path.exists(_qp):
+                try:
+                    torch.cuda.synchronize()
+                    _staged = q_all[-8:].detach().clone().cpu()
+                    with open(_qp, "wb") as _f:
+                        _mq = _model_q.contiguous()
+                        _st = _staged.contiguous()
+                        import struct as _struct
+                        _f.write(_struct.pack("iiiiii",
+                                              _mq.shape[0], _mq.shape[1], _mq.shape[2],
+                                              _st.shape[0], _st.shape[1], _st.shape[2]))
+                        _f.write(_mq.view(torch.uint16).numpy().tobytes())
+                        _f.write(_st.view(torch.uint16).numpy().tobytes())
+                    logger.warning("KVARN_TAIL_QPROBE saved r%d ptrs q_all=%s qbuf=%s scratch=%s ckv=%s",
+                                   self.dcp_rank, _qa_ptr, _qs_ptr, _sc_ptr, _ck_ptr)
+                except Exception as _e:
+                    logger.warning("KVARN_TAIL_QPROBE save failed %s", _e)
 
         if int(q.shape[1] if not isinstance(q, tuple) else q[0].shape[1]) != (
             input_num_heads
@@ -3181,34 +3374,100 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             cache_lengths=cache_seq_lens,
             selected_lengths=active_counts,
         )
-        if os.environ.get("KVARN_TAIL_PRIVATE_KV") == "1":
-            # Decisive fork test: bind the BODY launch to a private copy of
-            # the arena (same shape/stride). The corruption appears between
-            # the post-zero probe (clean) and the post-body probe
-            # (corrupted), so the body launch is the only suspect left.
-            _tkv = getattr(self, "_tail_private_kv", None)
-            if _tkv is None or _tkv.shape != kv_cache_for_run.shape:
-                _tkv = torch.empty_strided(
-                    kv_cache_for_run.shape,
-                    kv_cache_for_run.stride(),
-                    dtype=kv_cache_for_run.dtype,
-                    device=kv_cache_for_run.device,
-                )
-                self._tail_private_kv = _tkv
-            _tkv.copy_(kv_cache_for_run)
-            binding = self._bind(
-                plan,
-                scratch=scratch,
-                q=q_all,
-                kv_cache=_tkv,
-                selected_indices=selected_indices,
-                cache_lengths=cache_seq_lens,
-                selected_lengths=active_counts,
+        if os.environ.get("KVARN_TAIL_WRITEMAP") == "1":
+            # Write-map diagnostic: fill the arena with a per-row known
+            # pattern before the body launch. The post-body dump then
+            # identifies exactly which rows the kernel writes and with what.
+            _ar2d = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
+            _rid = (
+                torch.arange(_ar2d.shape[0], device=_ar2d.device, dtype=torch.uint8)
+                .unsqueeze(1)
             )
+            _ar2d.copy_(_rid)
+        if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
+            global _KVAR_DBG_SEQ
+            try:
+                _KVAR_DBG_SEQ
+            except NameError:
+                _KVAR_DBG_SEQ = 0
+            _ql = _KVAR_DBG_SEQ
+            if _ql <= 12:
+                try:
+                    torch.cuda.synchronize()
+                    _ar_l = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
+                    _rl = list(range(760, 790)) + list(range(2810, 2830))
+                    _kvarn_dbg_save({"rows": _ar_l[_rl].cpu().contiguous(),
+                                "rows_idx": _rl},
+                               f"/home/js/kvarn-probes/kvarn-layer{_ql}-prebody-r{self.dcp_rank}.pt")
+                except Exception as _e:
+                    logger.warning("layer prebody probe failed %s", _e)
         result = self._run(binding)
         # The extend kernel returns LSE even when decode does not request it.
         output, lse = result if isinstance(result, tuple) else (result, None)
-        if tail_active:
+        _kvarn_force_sync()
+        if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
+            try:
+                torch.cuda.synchronize()
+                _ar_l2 = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
+                _rl2 = list(range(760, 790)) + list(range(2810, 2830))
+                _kvarn_dbg_save({"rows": _ar_l2[_rl2].cpu().contiguous(),
+                            "rows_idx": _rl2},
+                           f"/home/js/kvarn-probes/kvarn-layer{_ql}-postbody-r{self.dcp_rank}.pt")
+                _ob = output.detach().clone().cpu()
+                _kvarn_dbg_save({
+                            "out_rows": _ob[1520:1570],
+                            "out_nan_rows": [
+                                1520 + i for i in range(_ob[1520:1570].shape[0])
+                                if bool(torch.isnan(_ob[1520 + i].float()).any())
+                            ],
+                        },
+                       f"/home/js/kvarn-probes/kvarn-layer{_ql}-bodyout-r{self.dcp_rank}.pt")
+                _KVAR_DBG_SEQ = _ql + 1
+            except Exception as _e:
+                logger.warning("layer postbody probe failed %s", _e)
+        if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
+            _qp2 = f"/home/js/kvarn-probes/kvarn-qprobe-postbody-r{self.dcp_rank}.pt"
+            if not os.path.exists(_qp2):
+                try:
+                    torch.cuda.synchronize()
+                    _qpost = q_all[-8:].detach().clone().cpu().contiguous()
+                    _ar_post = kv_cache_for_run.reshape(
+                        -1, self._cache_record_bytes)
+                    _rows = (list(range(0, 780)) + list(range(2048, 2830)))
+                    _kvarn_dbg_save(
+                        {
+                            "pid": os.getpid(),
+                            "rows_idx": _rows,
+                            "rows": _ar_post[_rows].cpu(),
+                        },
+                        f"/home/js/kvarn-probes/kvarn-arena-postbody-{os.getpid()}.pt",
+                    )
+                except Exception as _e:
+                    logger.warning("KVARN_TAIL_QPROBE arena-postbody failed %s", _e)
+            if not os.path.exists(_qp2):
+                try:
+                    torch.cuda.synchronize()
+                    _qpost = q_all[-8:].detach().clone().cpu().contiguous()
+                    _rt = getattr(binding, "runtime", binding)
+                    _views = {}
+                    try:
+                        for _k, _v in vars(_rt).items():
+                            if torch.is_tensor(_v):
+                                _views[_k] = (int(_v.data_ptr()), tuple(_v.shape), str(_v.dtype))
+                            elif hasattr(_v, "data_ptr"):
+                                _views[_k] = (int(_v.data_ptr()), None, str(type(_v)))
+                    except Exception as _e2:
+                        _views["err"] = str(_e2)
+                    with open(_qp2, "wb") as _f:
+                        import struct as _struct
+                        _f.write(_struct.pack("iii", _qpost.shape[0], _qpost.shape[1],
+                                              _qpost.shape[2]))
+                        _f.write(_qpost.view(torch.uint16).numpy().tobytes())
+                        _f.write(repr(_views).encode())
+                    logger.warning("KVARN_TAIL_QPROBE post-body r%d views=%s", self.dcp_rank, _views)
+                except Exception as _e:
+                    logger.warning("KVARN_TAIL_QPROBE post-body failed %s", _e)
+        if tail_active and not tail_skip_launch:
             # Second segment: the dense tail window through the fp8 arm,
             # then an exact base-e LSE re-merge of the two normalized
             # partial attentions (design doc §10.4).
@@ -3314,6 +3573,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                            device=tail_indices.device),
             )
             tail_lengths = tail_lengths.clamp_min(1)
+            if (
+                num_tokens <= self._decode_max_rows
+                and tail_indices.shape[-1]
+                == self._kvarn_tail_indices_buffer.shape[-1]
+            ):
+                # Captured decode graphs replay the tail launch without
+                # re-running this Python: bind the launch to persistent
+                # buffers instead of this step's fresh temporaries (the
+                # body's selection binds ckv_selected_indices_buffer for the
+                # same reason). The copy kernels are part of the capture, so
+                # replays recompute the temporaries from the live metadata
+                # and land them at a capture-stable address.
+                self._kvarn_tail_indices_buffer[:num_tokens].copy_(tail_indices)
+                self._kvarn_tail_lengths_buffer[:num_tokens].copy_(tail_lengths)
+                tail_indices = self._kvarn_tail_indices_buffer[:num_tokens]
+                tail_lengths = self._kvarn_tail_lengths_buffer[:num_tokens]
             if os.environ.get("KVARN_TAIL_PRIVATE_KV") == "1":
                 # Decisive fork test: bind the tail launch to a private copy
                 # of the arena (same shape/stride). If the canary passes, the
@@ -3340,6 +3615,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 cache_lengths=full_cache_lens,
                 selected_lengths=tail_lengths,
             )
+            if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
+                _tp = f"/home/js/kvarn-probes/kvarn-tailviews-r{self.dcp_rank}.pt"
+                if not os.path.exists(_tp):
+                    try:
+                        _rt = getattr(tail_binding, "runtime", tail_binding)
+                        _views = {}
+                        for _k, _v in vars(_rt).items():
+                            if torch.is_tensor(_v):
+                                _views[_k] = (int(_v.data_ptr()), tuple(_v.shape),
+                                              tuple(_v.stride()), str(_v.dtype))
+                        _views["_arena_ptr"] = int(_tail_kv.data_ptr())
+                        with open(_tp, "w") as _f:
+                            _f.write(repr(_views))
+                        logger.warning("KVARN_TAIL_QPROBE tailviews r%d: %s", self.dcp_rank, _views)
+                    except Exception as _e:
+                        logger.warning("KVARN_TAIL_QPROBE tailviews failed %s", _e)
             # The body launch's output may alias the shared kernel scratch;
             # keep a private copy before the tail launch reuses it.
             body_output = output.clone()
@@ -3349,26 +3640,114 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 and not torch.cuda.is_current_stream_capturing()
                 and plan_key[0] == "ckv_extend"
                 and tail_lens_real.max().item() > 0
-                and not os.path.exists("/tmp/kvarn-mid-probe.pt")
+                and not os.path.exists("/home/js/kvarn-probes/kvarn-mid-probe.pt")
             ):
                 try:
                     _ar = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
-                    torch.save(
+                    _kvarn_dbg_save(
                         {
                             "rank": self.dcp_rank,
                             "arena_full": _ar.cpu(),
                             "pid": os.getpid(),
                             "arena_ptr": int(kv_cache_for_run.data_ptr()),
                         },
-                        f"/tmp/kvarn-mid-{os.getpid()}.pt",
+                        f"/home/js/kvarn-probes/kvarn-mid-{os.getpid()}.pt",
                     )
                     logger.warning("KVARN_TAIL_DEBUG: mid probe saved")
                 except Exception as _e:
                     logger.warning("KVARN_TAIL_DEBUG: mid probe failed %s", _e)
+            _pre_tail = None
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and num_tokens > 1000
+                and globals().get("_KVAR_DBG_SEQ", 0) <= 12
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    _pt_seq = globals().get("_KVAR_DBG_SEQ", 0)
+                    _ar_t = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
+                    _rows_t = list(range(1530, 1570)) + list(range(2810, 2830))
+                    _pre_tail = _ar_t[_rows_t].cpu().contiguous()
+                    _kvarn_dbg_save(
+                        {"pid": os.getpid(), "rows_idx": _rows_t,
+                         "rows": _pre_tail},
+                        f"/home/js/kvarn-probes/kvarn-stage{_pt_seq}-pretail-r{self.dcp_rank}.pt",
+                    )
+                except Exception as _e:
+                    logger.warning("pretail probe failed %s", _e)
             tail_result = self._run(tail_binding)
             tail_output, tail_lse = (
                 tail_result if isinstance(tail_result, tuple) else (tail_result, None)
             )
+            _kvarn_force_sync()
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and not torch.cuda.is_current_stream_capturing()
+                and plan_key[0] == "decode"
+                and tail_lens_real.max().item() > 100
+                and not os.path.exists(
+                    f"/home/js/kvarn-probes/kvarn-decodecap-r{self.dcp_rank}.pt"
+                )
+            ):
+                # One-shot decode-tail capture (MTP bug hunt): the decode
+                # path runs in FULL CUDA graphs, so this only fires under
+                # --enforce-eager. Full launch state for the offline replay.
+                try:
+                    _ar_d = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
+                    _cap = {
+                        "rank": self.dcp_rank,
+                        "pool_rows": _ar_d.shape[0],
+                        "q": q_all[:num_tokens].cpu(),
+                        "tail_indices": tail_indices.cpu(),
+                        "tail_lengths": tail_lengths.cpu(),
+                        "tail_lens_real": tail_lens_real.cpu(),
+                        "cache_lengths": full_cache_lens[:num_tokens].cpu(),
+                        "csl": csl[:num_tokens].cpu()
+                        if csl.shape[0] >= num_tokens else csl.cpu(),
+                        "ts": ts[:num_reqs].cpu(),
+                        "req_ids": req_ids.cpu(),
+                        "block_table": attn_metadata.block_table.cpu(),
+                        "block_size": int(attn_metadata.block_size),
+                        "tail_out": tail_output.cpu(),
+                        "tail_lse": tail_lse.cpu()
+                        if tail_lse is not None else None,
+                        "body_out": body_output.cpu(),
+                        "body_lse": body_lse.cpu()
+                        if body_lse is not None else None,
+                    }
+                    # Save the metadata FIRST (safe ops only): if the record
+                    # gather below trips a device assert on a garbage slot
+                    # id, the launch state is already on disk.
+                    _kvarn_dbg_save(
+                        _cap,
+                        f"/home/js/kvarn-probes/kvarn-decodecap-r{self.dcp_rank}.pt",
+                    )
+                    _cap["tail_rows"] = _ar_d[
+                        tail_indices.clamp(0, _ar_d.shape[0] - 1)
+                    ].cpu()
+                    _kvarn_dbg_save(
+                        _cap,
+                        f"/home/js/kvarn-probes/kvarn-decodecap-r{self.dcp_rank}.pt",
+                    )
+                    logger.warning("KVARN_TAIL_DEBUG: decodecap saved r%d", self.dcp_rank)
+                except Exception as _e:
+                    logger.warning("decodecap failed %s", _e)
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and _pre_tail is not None
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    _pt2_seq = globals().get("_KVAR_DBG_SEQ", 0)
+                    _ar_t2 = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
+                    _rows_t2 = list(range(1530, 1570)) + list(range(2810, 2830))
+                    _kvarn_dbg_save(
+                        {"pid": os.getpid(), "rows_idx": _rows_t2,
+                         "rows": _ar_t2[_rows_t2].cpu().contiguous()},
+                        f"/home/js/kvarn-probes/kvarn-stage{_pt2_seq}-posttail-r{self.dcp_rank}.pt",
+                    )
+                except Exception as _e:
+                    logger.warning("posttail probe failed %s", _e)
             if (
                 os.environ.get("KVARN_TAIL_DEBUG")
                 and not torch.cuda.is_current_stream_capturing()
@@ -3381,24 +3760,24 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 and not torch.cuda.is_current_stream_capturing()
                 and plan_key[0] == "ckv_extend"
                 and tail_lens_real.max().item() > 0
-                and getattr(self, "_dbg_ext_count", 0) <= 3
+                and globals().get("_KVAR_DBG_SEQ", 0) == 7
             ):
                 try:
                     _rec = self._cache_record_bytes
                     _arena = kv_cache_for_run.reshape(-1, _rec)
-                    _n = 8
-                    _si = selected_indices[-_n:]
-                    _ti = tail_indices[-_n:]
-                    torch.save(
+                    _pr = slice(1520, 1570)
+                    _si = selected_indices[_pr]
+                    _ti = tail_indices[_pr]
+                    _kvarn_dbg_save(
                         {
-                            "q": q_all[-_n:].cpu(),
+                            "q": q_all[_pr].cpu(),
                             "tail_indices": _ti.cpu(),
-                            "tail_lengths": tail_lengths[-_n:].cpu(),
-                            "tail_lens_real": tail_lens_real[-_n:].cpu(),
-                            "cache_lengths": full_cache_lens[-_n:].cpu(),
-                            "boundary": boundary_global[-_n:].cpu(),
+                            "tail_lengths": tail_lengths[_pr].cpu(),
+                            "tail_lens_real": tail_lens_real[_pr].cpu(),
+                            "cache_lengths": full_cache_lens[_pr].cpu(),
+                            "boundary": boundary_global[_pr].cpu(),
                             "sel_indices": _si.cpu(),
-                            "active_counts": active_counts[-_n:].cpu(),
+                            "active_counts": active_counts[_pr].cpu(),
                             "tail_rows": _arena[
                                 _ti.clamp(min=0).reshape(-1).to(torch.int64)
                             ].cpu(),
@@ -3406,15 +3785,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 _si.clamp(min=0).reshape(-1).to(torch.int64)
                             ].cpu(),
                             "plan_key": str(plan_key[0]),
-                            "tail_out": tail_output[-_n:].cpu(),
-                            "tail_lse": tail_lse[-_n:].cpu(),
-                            "body_out": body_output[-_n:].cpu(),
-                            "body_lse": body_lse[-_n:].cpu(),
-                            "merged_out": output[-_n:].cpu(),
+                            "tail_out": tail_output[_pr].cpu(),
+                            "tail_lse": tail_lse[_pr].cpu(),
+                            "body_out": body_output[_pr].cpu(),
+                            "body_lse": body_lse[_pr].cpu(),
+                            "premerge_out": output[_pr].cpu(),
                             "dbg_ext_count": self._dbg_ext_count,
-                            "arena_full": _arena[:4200].cpu(),
                         },
-                        f"/tmp/kvarn-ext-cap-{self._dbg_ext_count}.pt",
+                        "/home/js/kvarn-probes/kvarn-extcap-L6tail-r0.pt",
                     )
                     logger.warning(
                         "KVARN_TAIL_DEBUG: ext capture %d saved",
@@ -3426,6 +3804,41 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             merged = merge_tail_lse(tail_output, tail_lse, body_output, body_lse)
             empty_row = (tail_lens_real == 0)[:, None, None]
             output = torch.where(empty_row, body_output, merged)
+            _kvarn_force_sync()
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and globals().get("_KVAR_DBG_SEQ", 0) == 7
+            ):
+                try:
+                    torch.cuda.synchronize()
+                    _mg = output.detach().clone().float().cpu()
+                    _to = tail_output.detach().float().cpu()
+                    _tl = tail_lse.detach().float().cpu()
+                    _mr = slice(1520, 1570)
+                    _kvarn_dbg_save(
+                        {
+                            "merged_rows": _mg[_mr],
+                            "tail_lens_real": tail_lens_real[_mr].cpu(),
+                            "tail_out_bad_rows": [
+                                1520 + i for i in range(50)
+                                if bool(torch.isnan(_to[1520 + i]).any()
+                                        or torch.isinf(_to[1520 + i]).any())
+                            ],
+                            "tail_lse_bad_rows": [
+                                1520 + i for i in range(50)
+                                if bool(torch.isnan(_tl[1520 + i]).any()
+                                        or torch.isinf(_tl[1520 + i]).any())
+                            ],
+                            "merged_bad_rows": [
+                                1520 + i for i in range(50)
+                                if bool(torch.isnan(_mg[1520 + i]).any()
+                                        or torch.isinf(_mg[1520 + i]).any())
+                            ],
+                        },
+                        f"/home/js/kvarn-probes/kvarn-mergecap-L6tail-r{self.dcp_rank}.pt",
+                    )
+                except Exception as _e:
+                    logger.warning("merge cap failed %s", _e)
             lse = (
                 torch.where(
                     (tail_lens_real == 0)[:, None],
@@ -3468,10 +3881,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 _ph("pre-map", _postcopy)
                 torch.cuda.synchronize()
             if num_tokens > 100 and not os.path.exists(
-                "/tmp/kvarn-launch-capture.pt"
+                "/home/js/kvarn-probes/kvarn-launch-capture.pt"
             ):
                 try:
-                    torch.save(
+                    _kvarn_dbg_save(
                         {
                             "q": q_all[:24].cpu(),
                             "sel": selected_indices[:24].cpu(),
@@ -3487,7 +3900,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             "arena_dtype": str(kv_cache_for_run.dtype),
                             "out_head": output[:24].cpu(),
                         },
-                        "/tmp/kvarn-launch-capture.pt",
+                        "/home/js/kvarn-probes/kvarn-launch-capture.pt",
                     )
                 except Exception as _e:
                     print("[kvarn-gather-dbg] capture save failed:", _e,
