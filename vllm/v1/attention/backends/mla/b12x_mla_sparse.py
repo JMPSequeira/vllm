@@ -3103,6 +3103,51 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             tail_output, tail_lse = (
                 tail_result if isinstance(tail_result, tuple) else (tail_result, None)
             )
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and not torch.cuda.is_current_stream_capturing()
+                and plan_key[0] == "ckv_extend"
+                and tail_lens_real.max().item() > 0
+            ):
+                self._dbg_ext_count = getattr(self, "_dbg_ext_count", 0) + 1
+            if (
+                os.environ.get("KVARN_TAIL_DEBUG")
+                and not torch.cuda.is_current_stream_capturing()
+                and plan_key[0] == "ckv_extend"
+                and tail_lens_real.max().item() > 0
+                and getattr(self, "_dbg_ext_count", 0) == 2
+                and not os.path.exists("/tmp/kvarn-tail-capture.pt")
+            ):
+                try:
+                    torch.save(
+                        {
+                            "q": q_all[-8:].cpu(),
+                            "tail_indices": tail_indices[-8:].cpu(),
+                            "tail_lengths": tail_lengths[-8:].cpu(),
+                            "tail_lens_real": tail_lens_real[-8:].cpu(),
+                            "cache_lengths": full_cache_lens[-8:].cpu(),
+                            "boundary": boundary_global[-8:].cpu(),
+                            "tail_rows": (
+                                kv_cache_for_run.reshape(
+                                    -1, self._cache_record_bytes
+                                )[
+                                    tail_indices[-8:]
+                                    .clamp(min=0)
+                                    .reshape(-1)
+                                    .to(torch.int64)
+                                ].cpu()
+                            ),
+                            "plan_key": str(plan_key[0]),
+                            "out": tail_output[-8:].cpu(),
+                            "lse": tail_lse[-8:].cpu(),
+                            "body_out": body_output[-8:].cpu(),
+                            "body_lse": body_lse[-8:].cpu(),
+                        },
+                        "/tmp/kvarn-tail-capture.pt",
+                    )
+                    logger.warning("KVARN_TAIL_DEBUG: tail capture saved")
+                except Exception as _e:
+                    logger.warning("KVARN_TAIL_DEBUG: capture failed %s", _e)
             assert body_lse is not None and tail_lse is not None
             merged = merge_tail_lse(tail_output, tail_lse, body_output, body_lse)
             empty_row = (tail_lens_real == 0)[:, None, None]
