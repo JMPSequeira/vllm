@@ -206,6 +206,10 @@ class KVCacheManager:
         # there, or it requantizes later chunks' kvarn rows as fp8.
         self._kvarn_tail_ts_since: dict[str, int] = {}
         self._kvarn_tail_demotions: list[tuple[str, int, int]] = []
+        # Length of the prefix-cached (kvarn) portion of each request. The
+        # boundary must never sit below these rows: the reader decodes
+        # positions >= ts as fp8, and cached rows hold kvarn records.
+        self._kvarn_prefix_len: dict[str, int] = {}
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -816,9 +820,24 @@ class KVCacheManager:
             block_size = self.coordinator.single_type_managers[0].block_size
             ts_old = self._kvarn_tail_start.get(req_id, 0)
             ts_since = self._kvarn_tail_ts_since.get(req_id, 0)
+            # Prefix-cached rows hold kvarn records (they were published
+            # below some past boundary). The reader decodes positions
+            # >= ts as fp8, so ts must never sit below the prefix --
+            # otherwise a short-prompt/prefix-hit request decodes cached
+            # kvarn rows as fp8 (destroyed context) until its boundary
+            # finally climbs past the prefix.
+            if ts_since == 0:
+                # First publish: everything computed so far is the
+                # prefix hit (this step's tokens are not committed yet).
+                self._kvarn_prefix_len[req_id] = max(
+                    total_computed_tokens,
+                    self._kvarn_prefix_len.get(req_id, 0),
+                )
+            prefix_floor = self._kvarn_prefix_len.get(req_id, 0)
             ts_new = max(
                 num_tokens_to_cache - self.kvarn_tail_tokens,
                 ts_old,
+                prefix_floor,
             )
             if os.environ.get("KVARN_TAIL_DEBUG"):
                 logger.warning(
@@ -828,14 +847,28 @@ class KVCacheManager:
                     block_size, ts_old, ts_new,
                 )
             # A demotion range may only cover rows that WERE fp8 -- rows
-            # stored while the boundary was ts_old. On the first
-            # allocation ts_old=0 but the chunk was stored under the NEW
-            # boundary, so nothing below ts_new was ever fp8; same for a
-            # prefix-hit request (hit rows are never fp8).
+            # stored while the boundary was ts_old. On the first publish
+            # ever (ts_since == 0) nothing was stored under any boundary
+            # yet: prefill chunks store under the NEW boundary, so nothing
+            # below ts_new was ever fp8; a prefix-hit request's cached
+            # rows are kvarn and sit below the prefix floor. But a request
+            # whose boundary is still 0 across decode steps (short prompt
+            # without a prefix hit, ts = ntc - N clamps to 0 until
+            # ntc > N) stored EVERYTHING fp8 under ts_old=0; when ts
+            # first advances, rows [0, ts_new) must be demoted or the
+            # reader treats fp8 records as kvarn (the reader's body
+            # window [0, ts) reads them raw -- destroyed context, the
+            # lock-loop signature).
             if ts_old > 0:
                 hi = min(ts_new, ts_since)
                 if hi > ts_old:
                     self._kvarn_tail_demotions.append((req_id, ts_old, hi))
+            elif ts_since > 0:
+                # Decode-phase crossing: rows [0, min(ts_new, ts_since))
+                # were stored fp8 under the ts=0 era.
+                hi = min(ts_new, ts_since)
+                if hi > 0:
+                    self._kvarn_tail_demotions.append((req_id, 0, hi))
             self._kvarn_tail_start[req_id] = ts_new
             self._kvarn_tail_ts_since[req_id] = num_tokens_to_cache
             # Publish only whole pages that sit fully below the tail
@@ -869,6 +902,8 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self._kvarn_tail_start.pop(request.request_id, None)
+        self._kvarn_tail_ts_since.pop(request.request_id, None)
+        self._kvarn_prefix_len.pop(request.request_id, None)
         boundary_blocks = self._pop_boundary_blocks(request)
         self.block_pool.free_blocks(boundary_blocks)
         self.coordinator.free(request.request_id)
