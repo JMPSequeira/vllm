@@ -855,6 +855,15 @@ class B12xMLASparseMetadataBuilder(
         scheduler_config = vllm_config.scheduler_config
         max_tokens = scheduler_config.max_num_batched_tokens
         max_reqs = int(scheduler_config.max_num_seqs)
+        # Async scheduling keeps the host ahead of the device; the tail's
+        # captured decode graphs consume per-step staging that the next
+        # build() rewrite would race. A host-side drain at build() entry
+        # restores correctness (bisect: syncs inside build() fix async+tail,
+        # a post-forward sync does not). Only tail + async configs pay it.
+        self._kvarn_async_build_fence = bool(
+            getattr(vllm_config.cache_config, "kvarn_tail_tokens", 0) > 0
+            and scheduler_config.async_scheduling
+        )
         self._ckv_max_reqs = max_reqs
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
@@ -1252,7 +1261,19 @@ class B12xMLASparseMetadataBuilder(
                         )
                 except OSError:
                     pass
-        return self._build(
+        if (
+            getattr(self, "_kvarn_async_build_fence", False)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Tail + async: the host is ahead of the device here. Drain the
+            # stream BEFORE staging so this build's staging writes cannot
+            # race the previous step's still-pending captured work.
+            _n = getattr(self, "_kvarn_fence_fires", 0) + 1
+            self._kvarn_fence_fires = _n
+            if _n <= 3:
+                logger.warning("KVARN build fence fire #%d", _n)
+            torch.cuda.synchronize()
+        result = self._build(
             common_prefix_len,
             common_attn_metadata,
             fast_build,
@@ -1262,6 +1283,7 @@ class B12xMLASparseMetadataBuilder(
             selector_num_accepted_tokens=selector_num_accepted_tokens,
             selector_is_prefilling=selector_is_prefilling,
         )
+        return result
 
     def build_for_cudagraph_capture(
         self,

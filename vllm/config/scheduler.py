@@ -250,25 +250,6 @@ class SchedulerConfig:
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
 
-    def resolve_async_scheduling(self, cache_config) -> None:
-        """Async scheduling is unsafe with the kvarn precision tail.
-
-        The tail's decode path reads pool records and page-bookkeeping state
-        whose per-step publication is not yet async-safe: with async
-        scheduling the host runs ahead of the device and the captured decode
-        graphs observe step N+1's bookkeeping (reproduced as verbatim-recall
-        gibberish at >=528-token contexts on FULL_AND_PIECEWISE decode
-        graphs; --no-async-scheduling or any per-step host sync restores
-        correctness). Force the synchronous scheduler until the tail's
-        per-step state is published through stream-ordered buffers.
-        """
-        if (
-            self.async_scheduling is None
-            and cache_config is not None
-            and getattr(cache_config, "kvarn_tail_tokens", 0)
-        ):
-            self.async_scheduling = False
-
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,

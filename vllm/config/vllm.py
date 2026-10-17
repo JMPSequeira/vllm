@@ -1657,10 +1657,6 @@ class VllmConfig:
             and self.parallel_config.enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
-        # The kvarn precision tail forces the synchronous scheduler (its
-        # per-step bookkeeping is not async-safe yet); see
-        # SchedulerConfig.resolve_async_scheduling.
-        self.scheduler_config.resolve_async_scheduling(self.cache_config)
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
