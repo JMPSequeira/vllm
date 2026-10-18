@@ -2629,15 +2629,36 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         if boundary is not None
                         else None
                     )
+                    pos_v = (
+                        pos_g[owned]
+                        if pos_g is not None
+                        else None
+                    )
                     logger.warning(
                         "KVARN_TAIL_DEBUG store: tokens=%d prefills=%d "
-                        "slots=%d fp8=%d kvarn=%d ts=%s csl_min=%d "
+                        "slots=%d fp8=%d kvarn=%d dispatch_tail=%d "
+                        "pos_min=%s pos_max=%s ts=%s csl_min=%d "
                         "kvarn_csl_max=%s",
                         num_tokens,
                         attn_metadata.num_prefills,
                         int(valid.numel()),
                         n_fp8,
                         int(valid.numel()) - n_fp8,
+                        (
+                            int(is_tail.sum())
+                            if boundary is not None
+                            else -1
+                        ),
+                        (
+                            int(pos_v.min())
+                            if pos_v is not None
+                            else None
+                        ),
+                        (
+                            int(pos_v.max())
+                            if pos_v is not None
+                            else None
+                        ),
                         (
                             ts[: attn_metadata.num_reqs].tolist()
                             if ts is not None
@@ -3014,7 +3035,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             if ts is not None and os.environ.get("KVARN_TAIL_DEBUG") and (
                 not torch.cuda.is_current_stream_capturing()
             ):
-                rows_all = gathered_buffer[
+                # staging is row-granular (padded_tokens rows per rank);
+                # gathered_buffer is the raw byte workspace.
+                rows_all = staging[
                     : self.dcp_world_size * padded_tokens
                 ].reshape(-1, self._cache_record_bytes)
                 n_fp8_dense = int(
@@ -3451,6 +3474,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 flush=True,
             )
         full_cache_lens = cache_seq_lens
+        tail_skip_launch = bool(os.environ.get("KVARN_TAIL_SKIP_LAUNCH"))
         if tail_active and plan_key[0] != "decode":
             # The MG extend body is DENSE over cache_lengths: with fp8 tail
             # rows in the pool/arena it must stop at the tail boundary or it
