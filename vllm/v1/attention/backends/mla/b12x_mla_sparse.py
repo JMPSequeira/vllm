@@ -4015,7 +4015,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 _ph("pre-map", _postcopy)
                 torch.cuda.synchronize()
             if num_tokens > 100 and not os.path.exists(
-                "/home/js/kvarn-probes/kvarn-launch-capture.pt"
+                os.environ.get(
+                    "KVARN_GATHER_CAPTURE_PATH",
+                    "/tmp/kvarn-launch-capture.pt",
+                )
             ):
                 try:
                     _kvarn_dbg_save(
@@ -4034,7 +4037,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             "arena_dtype": str(kv_cache_for_run.dtype),
                             "out_head": output[:24].cpu(),
                         },
-                        "/home/js/kvarn-probes/kvarn-launch-capture.pt",
+                        os.environ.get(
+                            "KVARN_GATHER_CAPTURE_PATH",
+                            "/tmp/kvarn-launch-capture.pt",
+                        ),
                     )
                 except Exception as _e:
                     print("[kvarn-gather-dbg] capture save failed:", _e,
