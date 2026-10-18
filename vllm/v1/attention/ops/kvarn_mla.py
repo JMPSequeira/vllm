@@ -56,12 +56,15 @@ from vllm.v1.kv_cache_interface import parse_kvarn_mla_dtype
 # under the per-token record scheme; kept for C4 page alignment.
 _KVARN_TILE_TAIL_BYTES = 6400
 
+# GLM C4 index page: 64 pools x 132 bytes = 8448 bytes (33 * 256).
+_KVARN_INDEX_PAGE_BYTES = 8448
+
 __all__ = [
     "KvarnMlaLayout",
     "kvarn_mla_layout_from_dtype",
     "hadamard_matrix",
-    "pack_kvarn_mla_tile",
-    "unpack_kvarn_mla_tile",
+    "pack_kvarn_mla_records",
+    "unpack_kvarn_mla_records",
     "pack_bits",
     "unpack_bits",
 ]
@@ -108,25 +111,29 @@ class KvarnMlaLayout:
         return r
 
     @property
+    def tile_stride_bytes(self) -> int:
+        """Kernel tile stride: one tile of ``group`` records plus the reserved
+        per-tile tail region, rounded up to a whole C4 index page so the FP8
+        index tail placement (which aligns to C4 pages) sees the same stride
+        as the kernels."""
+        raw = self.record_bytes * self.group + _KVARN_TILE_TAIL_BYTES
+        return (
+            (raw + _KVARN_INDEX_PAGE_BYTES - 1) // _KVARN_INDEX_PAGE_BYTES
+        ) * _KVARN_INDEX_PAGE_BYTES
+
+    @property
     def page_tail_bytes_per_token(self) -> int:
-        """Per-token page tail: the 8448B C4 indexer tail plus the reserved
-        per-tile tail region (which sits right after the records, before the
-        indexer's aligned tail), rounded up to a whole 8448B C4 page so the
-        parent-page stride stays an exact C4-page multiple (tail bytes must
-        be a multiple of 33 per token)."""
-        needed = 8448 + _KVARN_TILE_TAIL_BYTES  # indexer + reserved tail
-        per_token = (needed + self.group - 1) // self.group
-        return (per_token + 32) // 33 * 33
+        """Per-token page tail: just enough so one page of ``group`` tokens
+        holds the rounded tile span plus the FP8 index tail (one C4 page).
+        The result keeps ``page_size_bytes`` an exact C4-page multiple."""
+        needed = self.tile_stride_bytes + _KVARN_INDEX_PAGE_BYTES
+        return (needed - self.record_bytes * self.group) // self.group
 
     @property
     def page_size_bytes(self) -> int:
-        return self.record_bytes * self.group + self.page_tail_bytes_per_token * self.group
-
-    @property
-    def tile_stride_bytes(self) -> int:
-        """Kernel tile stride: one tile of ``group`` records plus the reserved
-        per-tile tail region (mirrors b12x ``_TILE_TAIL_BYTES``)."""
-        return self.record_bytes * self.group + _KVARN_TILE_TAIL_BYTES
+        return (
+            self.record_bytes * self.group + self.page_tail_bytes_per_token * self.group
+        )
 
     @property
     def k_code_offset(self) -> int:
@@ -153,7 +160,6 @@ class KvarnMlaLayout:
         return self.v_scale_offset + 2
 
 
-
 def kvarn_mla_layout_from_dtype(kv_cache_dtype: str) -> KvarnMlaLayout:
     parsed = parse_kvarn_mla_dtype(kv_cache_dtype)
     if parsed is None:
@@ -167,9 +173,7 @@ def hadamard_matrix(dim: int, device: torch.device) -> torch.Tensor:
     """Orthonormal Sylvester Hadamard matrix (dim must be a power of two)."""
     h = torch.ones(1, 1, device=device, dtype=torch.float32)
     while h.shape[0] < dim:
-        h = torch.cat(
-            [torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0
-        )
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
     assert h.shape[0] == dim
     return h / math.sqrt(dim)
 
@@ -189,9 +193,7 @@ def rotate_latent(x: torch.Tensor, h_t: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def pack_bits(
-    values: torch.Tensor, bits: int
-) -> torch.Tensor:
+def pack_bits(values: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack unsigned integer codes ([..., C], 0 <= code < 2**bits) little-endian.
 
     Returns ``[..., ceil(C * bits / 8)]`` uint8. Bit i of the logical stream
@@ -201,9 +203,7 @@ def pack_bits(
     flat = values.reshape(-1, orig_shape[-1]).to(torch.int32)
     cols = flat.shape[1]
     out_bytes = math.ceil(cols * bits / 8)
-    acc = torch.zeros(
-        flat.shape[0], out_bytes, dtype=torch.int32, device=values.device
-    )
+    acc = torch.zeros(flat.shape[0], out_bytes, dtype=torch.int32, device=values.device)
     bit_index = torch.arange(cols, device=values.device) * bits
     rows = flat.shape[0]
     for b in range(bits):
@@ -217,9 +217,7 @@ def pack_bits(
 
 
 @torch.no_grad()
-def unpack_bits(
-    packed: torch.Tensor, bits: int, cols: int
-) -> torch.Tensor:
+def unpack_bits(packed: torch.Tensor, bits: int, cols: int) -> torch.Tensor:
     """Inverse of :func:`pack_bits`; returns int32 codes [..., cols]."""
     orig_shape = packed.shape
     flat = packed.reshape(-1, packed.shape[-1]).to(torch.int32)

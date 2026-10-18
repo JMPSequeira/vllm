@@ -458,9 +458,9 @@ class CommonAttentionMetadata:
 
     kvarn_tail_start: torch.Tensor | None = None
     """(batch_size,) int32: per-request tail start ts for the kvarn
-    precision tail (fp8 region = [ts, S), DCP-local positions). The
-    manager owns ts; extends reset it to S so gathers always read kvarn.
-    None when the tail is disabled."""
+    precision tail (fp8 region = [ts, S), DCP-local positions). ts is a
+    global, unaligned position that slides with S during extends AND
+    decodes; the manager owns it. None when the tail is disabled."""
 
     kvarn_tail_demote_ranges: torch.Tensor | None = None
     """(batch_size, 2) int32: per-request [lo, hi) position range whose fp8

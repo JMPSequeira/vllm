@@ -2129,6 +2129,15 @@ class Scheduler(SchedulerInterface):
             if self.kv_cache_manager.kvarn_tail_tokens
             else {}
         )
+        # Keep only demotions for requests still scheduled this step; a
+        # preempted request would otherwise leave a stale entry that
+        # crashes gpu_model_runner's req_ids.index(rid) lookup.
+        if kvarn_tail_demotions:
+            kvarn_tail_demotions = {
+                req_id: range_
+                for req_id, range_ in kvarn_tail_demotions.items()
+                if req_id in num_scheduled_tokens
+            }
         if os.environ.get("KVARN_TAIL_DEBUG") and kvarn_tail_starts:
             logger.warning(
                 "KVARN_TAIL_DEBUG scheduler: starts=%s demotions=%s",

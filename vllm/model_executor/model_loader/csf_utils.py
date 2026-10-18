@@ -101,11 +101,12 @@ class CsfTensorReader(ExitStack):
 
     def matrix(self, weight, scale, *, global_scale=None, input_scale=None):
         """Expose a lazy packed weight view and one projection's CPU scale data."""
-        scales = self._handle(scale)
+        fixed_name = f"{scale}.{self.codec}_csf_fixed"
+        exceptions_name = f"{scale}.{self.codec}_csf_exceptions"
         return CsfMatrix(
             weight=self._handle(weight).get_slice(weight),
-            fixed=scales.get_tensor(f"{scale}.{self.codec}_csf_fixed"),
-            exceptions=scales.get_tensor(f"{scale}.{self.codec}_csf_exceptions"),
+            fixed=self._handle(fixed_name).get_tensor(fixed_name),
+            exceptions=self._handle(exceptions_name).get_tensor(exceptions_name),
             global_scale=(
                 self._handle(global_scale).get_tensor(global_scale)
                 if global_scale is not None

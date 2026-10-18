@@ -282,7 +282,9 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             return 0 if report is None else report(projection, num_tokens)
 
         gate_bytes = max(size(self.g_a_proj), size(self.g_b_proj))
-        main_bytes = max(size(self.in_proj_qkvgfab), size(self.f_b_proj))
+        main_bytes = max(
+            *(size(p) for p in self.input_projections()), size(self.f_b_proj)
+        )
         if not (gate_bytes or main_bytes):
             return None, None
         gate_workspace, main_workspace = current_workspace_manager().get_simultaneous(
@@ -315,20 +317,25 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             g_proj_states = self.g_b_proj(g_a_states)[0]
 
         with use_preallocated_workspace(main_workspace):
-            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
-            # Same optional callback the shared forward offers after its first
-            # projection (e.g. the L2 weight prefetch of o_proj).
-            hook = getattr(self, "_l2_prefetch_hook", None)
-            if hook is not None:
-                hook(num_tokens)
-            mixed_qkv, beta, f_a = projected_qkvgfab.split(
-                [
-                    3 * self.local_projection_size,
-                    self.local_num_heads,
-                    self.head_dim,
-                ],
-                dim=-1,
-            )
+            if self.split_input_projection:
+                mixed_qkv, beta, f_a, projected_qkvgfab = self.project_split_input(
+                    hidden_states
+                )
+            else:
+                projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+                # Same optional callback the shared forward offers after its
+                # first projection (e.g. the L2 weight prefetch of o_proj).
+                hook = getattr(self, "_l2_prefetch_hook", None)
+                if hook is not None:
+                    hook(num_tokens)
+                mixed_qkv, beta, f_a = projected_qkvgfab.split(
+                    [
+                        3 * self.local_projection_size,
+                        self.local_num_heads,
+                        self.head_dim,
+                    ],
+                    dim=-1,
+                )
             g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)

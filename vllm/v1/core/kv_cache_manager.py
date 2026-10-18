@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -28,7 +29,6 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-import os
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
@@ -210,6 +210,7 @@ class KVCacheManager:
         # boundary must never sit below these rows: the reader decodes
         # positions >= ts as fp8, and cached rows hold kvarn records.
         self._kvarn_prefix_len: dict[str, int] = {}
+        self._kvarn_tail_debug = bool(os.environ.get("KVARN_TAIL_DEBUG"))
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -839,12 +840,16 @@ class KVCacheManager:
                 ts_old,
                 prefix_floor,
             )
-            if os.environ.get("KVARN_TAIL_DEBUG"):
+            if self._kvarn_tail_debug:
                 logger.warning(
                     "KVARN_TAIL_DEBUG mgr: req=%s ntc=%d N=%d bs=%d "
                     "ts_old=%d ts_new=%d",
-                    req_id, num_tokens_to_cache, self.kvarn_tail_tokens,
-                    block_size, ts_old, ts_new,
+                    req_id,
+                    num_tokens_to_cache,
+                    self.kvarn_tail_tokens,
+                    block_size,
+                    ts_old,
+                    ts_new,
                 )
             # A demotion range may only cover rows that WERE fp8 -- rows
             # stored while the boundary was ts_old. On the first publish

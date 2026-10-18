@@ -435,11 +435,12 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
             "arbitrary.scales.mxfp4_csf_fixed": fixed,
             "arbitrary.scales.mxfp4_csf_exceptions": exceptions,
         },
-        tensors / "scales.safetensors",
+        tensors / "csf_components.safetensors",
     )
     index = {
         "arbitrary.packed": "weights.safetensors",
-        "arbitrary.scales": "scales.safetensors",
+        "arbitrary.scales.mxfp4_csf_fixed": "csf_components.safetensors",
+        "arbitrary.scales.mxfp4_csf_exceptions": "csf_components.safetensors",
     }
     opened, closed = [], []
     original_open = csf_utils.safe_open
@@ -472,7 +473,7 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     assert (
         sorted(opened)
         == sorted(closed)
-        == ["scales.safetensors", "weights.safetensors"]
+        == ["csf_components.safetensors", "weights.safetensors"]
     )
 
 

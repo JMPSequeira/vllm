@@ -16,7 +16,6 @@ from vllm.v1.attention.ops.kvarn_mla import (
     unpack_bits,
     unpack_kvarn_mla_records,
 )
-from vllm.v1.kv_cache_interface import parse_kvarn_mla_dtype
 
 DTYPES = [
     "kvarn_mla_k4v4_g256",
@@ -28,9 +27,12 @@ DTYPES = [
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_dtype_dispatch(dtype: str):
     layout = kvarn_mla_layout_from_dtype(dtype)
-    assert layout.record_bytes == KvarnMlaLayout(
-        k_bits=layout.k_bits, v_bits=layout.v_bits, group=layout.group
-    ).record_bytes
+    assert (
+        layout.record_bytes
+        == KvarnMlaLayout(
+            k_bits=layout.k_bits, v_bits=layout.v_bits, group=layout.group
+        ).record_bytes
+    )
     # Mod-33 rule: 0 < r % 33 <= 21 (reserved per-tile tail fits the C4 gap).
     assert 0 < layout.record_bytes % 33 <= 21
     # Offsets must be non-overlapping, ordered, inside the record.
@@ -56,13 +58,25 @@ def test_record_widths():
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v2_g256").record_bytes == 400
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_tile_stride_and_page_geometry(dtype: str):
+    """The rounded tile stride + FP8 index tail must fit the allocated page
+    for every supported dtype (the _index_cache_view contract)."""
+    layout = kvarn_mla_layout_from_dtype(dtype)
+    index_page = 8448  # 64 pools x 132 bytes C4 page
+    # tile_stride_bytes is a whole number of C4 index pages.
+    assert layout.tile_stride_bytes % index_page == 0
+    # The page holds the rounded tile span plus one index tail page.
+    assert layout.page_size_bytes == layout.tile_stride_bytes + index_page
+    # Parent-page stride stays an exact C4-page multiple.
+    assert layout.page_size_bytes % index_page == 0
+
+
 @pytest.mark.parametrize("bits", [2, 4, 5])
 @pytest.mark.parametrize("cols", [512, 517])
 def test_pack_bits_roundtrip(bits: int, cols: int):
     gen = torch.Generator(device="cpu").manual_seed(0)
-    codes = torch.randint(
-        0, 2**bits, (7, cols), generator=gen, dtype=torch.int32
-    )
+    codes = torch.randint(0, 2**bits, (7, cols), generator=gen, dtype=torch.int32)
     packed = pack_bits(codes, bits)
     assert packed.shape[-1] == (cols * bits + 7) // 8
     assert (unpack_bits(packed, bits, cols) == codes).all()
@@ -78,7 +92,7 @@ def test_pack_unpack_parity(dtype: str):
     records = pack_kvarn_mla_records(latent, layout)
     assert records.shape == (layout.group, layout.record_bytes)
     # Pad region is zero.
-    assert int(records[:, layout.content_bytes:].sum()) == 0
+    assert int(records[:, layout.content_bytes :].sum()) == 0
 
     k_hat, v_hat = unpack_kvarn_mla_records(records, layout)
     assert k_hat.shape == latent.shape
@@ -139,9 +153,7 @@ def test_rotation_invariance_math():
     v = torch.randn(8, 512, generator=gen)
     qr = rotate_latent(q, h_t)  # H q
     kr = rotate_latent(k, h_t)  # H k
-    torch.testing.assert_close(
-        (qr * kr).sum(-1), (q * k).sum(-1), rtol=1e-4, atol=1e-4
-    )
+    torch.testing.assert_close((qr * kr).sum(-1), (q * k).sum(-1), rtol=1e-4, atol=1e-4)
     # output side: attention accumulates H v; H^T (H v) == v
     out_rot = rotate_latent(v, h_t)
     out = rotate_latent(out_rot, h_t.transpose(-2, -1))  # H^T (H v)

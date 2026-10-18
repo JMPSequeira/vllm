@@ -108,11 +108,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.is_sparse = mla_modules.is_sparse
         self.g_proj = mla_modules.g_proj
 
-        # KVarN MLA: cache records hold Hadamard-rotated latents. Rotate the
-        # query, the stored latent, and the attention output in this layer's
-        # forward (exact math: H is orthonormal; see
-        # vllm/v1/attention/ops/kvarn_mla.py). Weight-level folds are a later
-        # optimization; this works with any checkpoint quantization.
+        # KVarN MLA: cache records hold Hadamard-rotated latents. forward
+        # rotates only kv_c_normed; process_weights_after_loading folds H
+        # into W_UK_T and W_UV (exact math: H is orthonormal; see
+        # vllm/v1/attention/ops/kvarn_mla.py).
         self._kvarn_rotate = kvarn_cache_dtype_enabled(
             getattr(cache_config, "cache_dtype", None)
         )
@@ -180,11 +179,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     def _get_kvarn_h_t(self, like: torch.Tensor) -> torch.Tensor:
         """Lazily materialize H^T on ``like``'s device/dtype (bf16 compute)."""
         h_t = self._kvarn_h_t
-        if (
-            h_t is None
-            or h_t.device != like.device
-            or h_t.dtype != like.dtype
-        ):
+        if h_t is None or h_t.device != like.device or h_t.dtype != like.dtype:
             latent_dim = self.kv_lora_rank
             h = hadamard_matrix(latent_dim, like.device)
             h_t = h.transpose(-2, -1).to(like.dtype)
@@ -280,8 +275,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self._kvarn_rotate:
             h_t = self._get_kvarn_h_t(kv_c_normed)
             # The cache record stores H @ kv_c_normed; the dequant path
-            # recovers the original frame through the VarN rescale chain, so
-            # only this rotation is needed on the store side.
+            # recovers the original frame through the folded W_UK_T / W_UV,
+            # so only this rotation is needed on the store side.
             kv_c_normed = rotate_latent(kv_c_normed, h_t)
 
         attn_out = self.mla_attn(

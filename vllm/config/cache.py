@@ -388,6 +388,24 @@ class CacheConfig:
             )
         return cache_dtype
 
+    @field_validator("kvarn_tail_tokens", mode="after")
+    @classmethod
+    def _validate_kvarn_tail_tokens(cls, value: int, info: Any) -> int:
+        if value == 0:
+            return value
+        cache_dtype = info.field_values.get("cache_dtype", "")
+        if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_mla_"):
+            raise ValueError(
+                "kvarn_tail_tokens requires a kvarn_mla_* cache_dtype, "
+                f"got {cache_dtype!r}"
+            )
+        if value % 256 != 0:
+            raise ValueError(
+                "kvarn_tail_tokens must be a multiple of 256 "
+                f"(the kvarn tile group), got {value}"
+            )
+        return value
+
     def get_resolved_kv_cache_layout(self) -> KVCacheLayout:
         if self.kv_cache_layout is None:
             raise ValueError(

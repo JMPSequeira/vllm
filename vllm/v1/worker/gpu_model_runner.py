@@ -2542,10 +2542,7 @@ class GPUModelRunner(
             req_index = self.input_batch.req_id_to_index
             for req_id, ts in kvarn_tail_starts.items():
                 idx = req_index.get(req_id)
-                if (
-                    idx is not None
-                    and idx < self._kvarn_tail_start_buf.shape[0]
-                ):
+                if idx is not None and idx < self._kvarn_tail_start_buf.shape[0]:
                     self._kvarn_tail_start_buf[idx] = ts
             for req_id, (lo, hi) in (
                 getattr(self, "_kvarn_tail_demotions_step", None) or {}
@@ -6220,6 +6217,19 @@ class GPUModelRunner(
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
+
+                # KVarN tail: a FULL capture must contain the tail ops, so
+                # stage neutral tail metadata (ts=0 => all body, no
+                # demotions) into the stable buffers before
+                # _build_attention_metadata binds their addresses. Real
+                # batches keep using scheduler-provided tail metadata.
+                if (
+                    self.cache_config.kvarn_tail_tokens
+                    and isinstance(self.cache_config.cache_dtype, str)
+                    and self.cache_config.cache_dtype.startswith("kvarn_mla_")
+                ):
+                    self._kvarn_tail_starts_step = {"capture": 0}
+                    self._kvarn_tail_demotions_step = {}
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
