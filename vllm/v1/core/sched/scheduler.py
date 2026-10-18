@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import math
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -365,9 +364,6 @@ class Scheduler(SchedulerInterface):
             num_lookahead_tokens=self.num_lookahead_tokens,
             enable_mamba_fine_grained_prefix_cache=(
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
-            ),
-            kvarn_tail_tokens=int(
-                getattr(self.cache_config, "kvarn_tail_tokens", 0) or 0
             ),
         )
         # Bind after construction so connectors can access the cache manager.
@@ -2120,31 +2116,6 @@ class Scheduler(SchedulerInterface):
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
-        kvarn_tail_demotions = self.kv_cache_manager.take_kvarn_tail_demotions()
-        kvarn_tail_starts = (
-            {
-                req_id: self.kv_cache_manager._kvarn_tail_start.get(req_id, 0)
-                for req_id in num_scheduled_tokens
-            }
-            if self.kv_cache_manager.kvarn_tail_tokens
-            else {}
-        )
-        # Keep only demotions for requests still scheduled this step; a
-        # preempted request would otherwise leave a stale entry that
-        # crashes gpu_model_runner's req_ids.index(rid) lookup.
-        if kvarn_tail_demotions:
-            kvarn_tail_demotions = {
-                req_id: range_
-                for req_id, range_ in kvarn_tail_demotions.items()
-                if req_id in num_scheduled_tokens
-            }
-        if os.environ.get("KVARN_TAIL_DEBUG") and kvarn_tail_starts:
-            logger.warning(
-                "KVARN_TAIL_DEBUG scheduler: starts=%s demotions=%s",
-                kvarn_tail_starts,
-                kvarn_tail_demotions,
-            )
-
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         batch_size = len(num_scheduled_tokens)
@@ -2213,8 +2184,6 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
-            kvarn_tail_starts=kvarn_tail_starts,
-            kvarn_tail_demotions=kvarn_tail_demotions,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),

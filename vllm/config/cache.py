@@ -182,12 +182,6 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
-    kvarn_tail_tokens: int = Field(default=0, ge=0)
-    """Number of newest tokens kept in a high-fidelity fp8_ds_mla-format tail
-    at the end of the KV cache while the older body stays kvarn-quantized
-    (kvarn_mla_* cache dtypes only). 0 disables the tail (default); launch
-    targets are 1024/2048/4096. Must be a multiple of the 256-token kvarn
-    tile group and of the DCP world size."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
@@ -387,24 +381,6 @@ class CacheConfig:
                 str(cache_dtype),
             )
         return cache_dtype
-
-    @field_validator("kvarn_tail_tokens", mode="after")
-    @classmethod
-    def _validate_kvarn_tail_tokens(cls, value: int, info: Any) -> int:
-        if value == 0:
-            return value
-        cache_dtype = info.field_values.get("cache_dtype", "")
-        if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_mla_"):
-            raise ValueError(
-                "kvarn_tail_tokens requires a kvarn_mla_* cache_dtype, "
-                f"got {cache_dtype!r}"
-            )
-        if value % 256 != 0:
-            raise ValueError(
-                "kvarn_tail_tokens must be a multiple of 256 "
-                f"(the kvarn tile group), got {value}"
-            )
-        return value
 
     def get_resolved_kv_cache_layout(self) -> KVCacheLayout:
         if self.kv_cache_layout is None:

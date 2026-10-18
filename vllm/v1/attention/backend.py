@@ -456,17 +456,6 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
-    kvarn_tail_start: torch.Tensor | None = None
-    """(batch_size,) int32: per-request tail start ts for the kvarn
-    precision tail (fp8 region = [ts, S), DCP-local positions). ts is a
-    global, unaligned position that slides with S during extends AND
-    decodes; the manager owns it. None when the tail is disabled."""
-
-    kvarn_tail_demote_ranges: torch.Tensor | None = None
-    """(batch_size, 2) int32: per-request [lo, hi) position range whose fp8
-    records must be re-quantized to kvarn this step (block-aligned tail
-    crossings). (0, 0) = nothing to demote. None when the tail is off."""
-
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec

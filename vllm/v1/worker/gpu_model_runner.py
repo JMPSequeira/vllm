@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -2518,45 +2517,6 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
-        # KVarN precision tail: per-request hit lengths + demotion ranges
-        # (host-built each step; empty when the tail is disabled).
-        kvarn_tail_start = None
-        kvarn_tail_demote_ranges = None
-        kvarn_tail_starts = getattr(self, "_kvarn_tail_starts_step", None) or {}
-        if kvarn_tail_starts:
-            # Persistent, in-place-updated staging. A FULL CUDA graph binds
-            # the capture-time tensor address, so a fresh per-step tensor is
-            # either frozen after the allocator recycles it or, under async
-            # scheduling, racy against a still-pending replay. The body's
-            # inputs follow the same persistent-buffer contract.
-            if getattr(self, "_kvarn_tail_start_buf", None) is None:
-                max_reqs = self.scheduler_config.max_num_seqs
-                self._kvarn_tail_start_buf = torch.zeros(
-                    max_reqs, dtype=torch.int32, device=self.device
-                )
-                self._kvarn_tail_demote_ranges_buf = torch.zeros(
-                    max_reqs, 2, dtype=torch.int32, device=self.device
-                )
-            self._kvarn_tail_start_buf.zero_()
-            self._kvarn_tail_demote_ranges_buf.zero_()
-            req_index = self.input_batch.req_id_to_index
-            for req_id, ts in kvarn_tail_starts.items():
-                idx = req_index.get(req_id)
-                if idx is not None and idx < self._kvarn_tail_start_buf.shape[0]:
-                    self._kvarn_tail_start_buf[idx] = ts
-            for req_id, (lo, hi) in (
-                getattr(self, "_kvarn_tail_demotions_step", None) or {}
-            ).items():
-                idx = req_index.get(req_id)
-                if (
-                    idx is not None
-                    and idx < self._kvarn_tail_demote_ranges_buf.shape[0]
-                ):
-                    self._kvarn_tail_demote_ranges_buf[idx, 0] = lo
-                    self._kvarn_tail_demote_ranges_buf[idx, 1] = hi
-            kvarn_tail_start = self._kvarn_tail_start_buf
-            kvarn_tail_demote_ranges = self._kvarn_tail_demote_ranges_buf
-
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2574,8 +2534,6 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
-            kvarn_tail_start=kvarn_tail_start,
-            kvarn_tail_demote_ranges=kvarn_tail_demote_ranges,
         )
 
         if self.dcp_world_size > 1:
@@ -4293,8 +4251,6 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        if os.environ.get("KVARN_TAIL_DEBUG"):
-            logger.warning("KVARN_TAIL_DEBUG execute_model entry")
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4429,17 +4385,6 @@ class GPUModelRunner(
                 ubatch_slices,
                 ubatch_slices_padded,
             )
-
-            # KVarN precision tail: per-step scheduler state consumed by the
-            # common-metadata build below.
-            self._kvarn_tail_starts_step = scheduler_output.kvarn_tail_starts
-            self._kvarn_tail_demotions_step = scheduler_output.kvarn_tail_demotions
-            if os.environ.get("KVARN_TAIL_DEBUG"):
-                logger.warning(
-                    "KVARN_TAIL_DEBUG runner4418: starts=%s demotions=%s",
-                    scheduler_output.kvarn_tail_starts,
-                    scheduler_output.kvarn_tail_demotions,
-                )
 
             # True if any attention backend handles KV cache update separately
             # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
@@ -6217,19 +6162,6 @@ class GPUModelRunner(
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
-
-                # KVarN tail: a FULL capture must contain the tail ops, so
-                # stage neutral tail metadata (ts=0 => all body, no
-                # demotions) into the stable buffers before
-                # _build_attention_metadata binds their addresses. Real
-                # batches keep using scheduler-provided tail metadata.
-                if (
-                    self.cache_config.kvarn_tail_tokens
-                    and isinstance(self.cache_config.cache_dtype, str)
-                    and self.cache_config.cache_dtype.startswith("kvarn_mla_")
-                ):
-                    self._kvarn_tail_starts_step = {"capture": 0}
-                    self._kvarn_tail_demotions_step = {}
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(

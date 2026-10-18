@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -49,12 +48,6 @@ if TYPE_CHECKING:
         BatchExecutionDescriptor,
         CudaGraphManager,
     )
-
-
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-_KVARN_TAIL_DEBUG = bool(os.environ.get("KVARN_TAIL_DEBUG"))
 
 
 @dataclass(frozen=True)
@@ -473,20 +466,7 @@ def build_attn_metadata(
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
     uniform_decode_graph: bool = False,
-    kvarn_tail_start: torch.Tensor | None = None,
-    kvarn_tail_demote_ranges: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    if _KVARN_TAIL_DEBUG:
-        logger.warning(
-            "KVARN_TAIL_DEBUG bam: cls=%s tail_start=%s demote=%s",
-            type(model_specific_attn_metadata).__name__
-            if model_specific_attn_metadata is not None
-            else None,
-            "None" if kvarn_tail_start is None else tuple(kvarn_tail_start.shape),
-            "None"
-            if kvarn_tail_demote_ranges is None
-            else tuple(kvarn_tail_demote_ranges.shape),
-        )
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
@@ -576,8 +556,6 @@ def build_attn_metadata(
                         req_idx=req_idx,
                         _token_to_req_indices_cache=token_to_req_indices,
                         uniform_decode_graph=uniform_decode_graph,
-                        kvarn_tail_start=kvarn_tail_start,
-                        kvarn_tail_demote_ranges=kvarn_tail_demote_ranges,
                         **common_attn_metadata_extra_kwargs,
                     )
 

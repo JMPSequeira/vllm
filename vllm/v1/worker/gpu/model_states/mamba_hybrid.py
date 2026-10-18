@@ -349,15 +349,6 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
-        import os as _os
-        if _os.environ.get("KVARN_TAIL_DEBUG"):
-            from vllm.logger import init_logger as _il
-            _il(__name__).warning(
-                "KVARN_TAIL_DEBUG mhy: id=%s tail_tokens=%s has_dev=%s",
-                id(self) % 10000,
-                self.kvarn_tail_tokens,
-                self.kvarn_tail_start_dev is not None,
-            )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -376,12 +367,6 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
-            kvarn_tail_start=self.kvarn_tail_start_dev[:num_reqs]
-            if self.kvarn_tail_tokens
-            else None,
-            kvarn_tail_demote_ranges=self.kvarn_tail_demote_dev[:num_reqs]
-            if self.kvarn_tail_tokens
-            else None,
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(

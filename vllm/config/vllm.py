@@ -1515,21 +1515,6 @@ class VllmConfig:
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
 
-        # KVarN tail tokens must be divisible by the DCP world size so each
-        # rank owns a whole number of tail tokens.
-        kvarn_tail_tokens = self.cache_config.kvarn_tail_tokens
-        if (
-            kvarn_tail_tokens
-            and isinstance(self.cache_config.cache_dtype, str)
-            and self.cache_config.cache_dtype.startswith("kvarn_mla_")
-        ):
-            dcp_world_size = self.parallel_config.decode_context_parallel_size
-            if kvarn_tail_tokens % dcp_world_size != 0:
-                raise ValueError(
-                    "kvarn_tail_tokens must be a multiple of the DCP world "
-                    f"size ({dcp_world_size}), got {kvarn_tail_tokens}"
-                )
-
         if (
             self.scheduler_config.prefill_compute_share is not None
             and self.parallel_config.effective_data_parallel_size > 1

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -306,12 +306,6 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
-
-    # KVarN precision tail: per-request tail start ts (every scheduled
-    # request; fp8 region = [ts, S)) and this step's fp8->kvarn demotion
-    # ranges. Empty when the tail is disabled.
-    kvarn_tail_starts: dict[str, int] = field(default_factory=dict)
-    kvarn_tail_demotions: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     # Complete block-table rows that replace incrementally appended block IDs.
     block_table_updates: dict[str, tuple[list[int], ...]] | None = None

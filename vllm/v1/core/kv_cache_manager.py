@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -186,31 +185,8 @@ class KVCacheManager:
         enable_mamba_fine_grained_prefix_cache: bool = False,
         enable_boundary_checkpoints: bool = False,
         num_lookahead_tokens: int = 0,
-        kvarn_tail_tokens: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
-        # KVarN precision tail: a SLIDING window of the newest N tokens,
-        # fp8 at all times (prefill chunks included). ts advances with S;
-        # boundary crossings emit demotion ranges (fp8 -> kvarn) for the
-        # worker. The tail region is never published to the prefix cache
-        # (published blocks always sit fully below ts = uniformly kvarn).
-        # The ckv-gather extend demotes the fp8 rows of its throwaway
-        # dense copy (kvarn_tail_demote_gathered), so the pool keeps the
-        # sliding fp8 window intact. 0 disables the feature and
-        # reproduces the stock caching behavior exactly.
-        self.kvarn_tail_tokens = int(kvarn_tail_tokens)
-        self._kvarn_tail_start: dict[str, int] = {}
-        # The sequence length when ts was last set: the fp8 rows under the
-        # current ts are exactly [ts, S_at_set) -- the window of the chunk
-        # that established it. The demotion of a superseded ts must stop
-        # there, or it requantizes later chunks' kvarn rows as fp8.
-        self._kvarn_tail_ts_since: dict[str, int] = {}
-        self._kvarn_tail_demotions: list[tuple[str, int, int]] = []
-        # Length of the prefix-cached (kvarn) portion of each request. The
-        # boundary must never sit below these rows: the reader decodes
-        # positions >= ts as fp8, and cached rows hold kvarn records.
-        self._kvarn_prefix_len: dict[str, int] = {}
-        self._kvarn_tail_debug = bool(os.environ.get("KVARN_TAIL_DEBUG"))
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -805,98 +781,9 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        # KVarN precision tail: uniform sliding rule for extends and
-        # decodes alike — ts = max(S-N, ts_old), UNALIGNED. The fp8 set is
-        # then exactly [ts, S) by construction: every store writes fp8 for
-        # pos >= the boundary in effect at store time, and the demotion
-        # [ts_old, ts_new) covers exactly the rows that were fp8 under
-        # ts_old (ts_new = S-N <= S_prev-N < S_prev always). Page-aligning
-        # ts instead (align_up(S-N, page)) put ts at/above S whenever
-        # N < page: the fp8 window was empty while the demotion still
-        # requantized kvarn rows as fp8 -- destroyed context, the
-        # lock-loop signature. Prefix-cache safety lives in the PUBLISH
-        # cap below: only whole pages fully below ts are published.
-        if self.kvarn_tail_tokens:
-            req_id = request.request_id
-            block_size = self.coordinator.single_type_managers[0].block_size
-            ts_old = self._kvarn_tail_start.get(req_id, 0)
-            ts_since = self._kvarn_tail_ts_since.get(req_id, 0)
-            # Prefix-cached rows hold kvarn records (they were published
-            # below some past boundary). The reader decodes positions
-            # >= ts as fp8, so ts must never sit below the prefix --
-            # otherwise a short-prompt/prefix-hit request decodes cached
-            # kvarn rows as fp8 (destroyed context) until its boundary
-            # finally climbs past the prefix.
-            if ts_since == 0:
-                # First publish: everything computed so far is the
-                # prefix hit (this step's tokens are not committed yet).
-                self._kvarn_prefix_len[req_id] = max(
-                    total_computed_tokens,
-                    self._kvarn_prefix_len.get(req_id, 0),
-                )
-            prefix_floor = self._kvarn_prefix_len.get(req_id, 0)
-            ts_new = max(
-                num_tokens_to_cache - self.kvarn_tail_tokens,
-                ts_old,
-                prefix_floor,
-            )
-            if self._kvarn_tail_debug:
-                logger.warning(
-                    "KVARN_TAIL_DEBUG mgr: req=%s ntc=%d N=%d bs=%d "
-                    "ts_old=%d ts_new=%d",
-                    req_id,
-                    num_tokens_to_cache,
-                    self.kvarn_tail_tokens,
-                    block_size,
-                    ts_old,
-                    ts_new,
-                )
-            # A demotion range may only cover rows that WERE fp8 -- rows
-            # stored while the boundary was ts_old. On the first publish
-            # ever (ts_since == 0) nothing was stored under any boundary
-            # yet: prefill chunks store under the NEW boundary, so nothing
-            # below ts_new was ever fp8; a prefix-hit request's cached
-            # rows are kvarn and sit below the prefix floor. But a request
-            # whose boundary is still 0 across decode steps (short prompt
-            # without a prefix hit, ts = ntc - N clamps to 0 until
-            # ntc > N) stored EVERYTHING fp8 under ts_old=0; when ts
-            # first advances, rows [0, ts_new) must be demoted or the
-            # reader treats fp8 records as kvarn (the reader's body
-            # window [0, ts) reads them raw -- destroyed context, the
-            # lock-loop signature).
-            if ts_old > 0:
-                hi = min(ts_new, ts_since)
-                if hi > ts_old:
-                    self._kvarn_tail_demotions.append((req_id, ts_old, hi))
-            elif ts_since > 0:
-                # Decode-phase crossing: rows [0, min(ts_new, ts_since))
-                # were stored fp8 under the ts=0 era.
-                hi = min(ts_new, ts_since)
-                if hi > 0:
-                    self._kvarn_tail_demotions.append((req_id, 0, hi))
-            self._kvarn_tail_start[req_id] = ts_new
-            self._kvarn_tail_ts_since[req_id] = num_tokens_to_cache
-            # Publish only whole pages that sit fully below the tail
-            # boundary: published blocks are uniformly kvarn, so prefix
-            # hits read consistent records.
-            num_tokens_to_cache = min(
-                num_tokens_to_cache,
-                (ts_new // block_size) * block_size,
-            )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
-
-    def take_kvarn_tail_demotions(self) -> dict[str, tuple[int, int]]:
-        """Drain this step's fp8->kvarn demotion ranges (request_id -> (lo, hi))."""
-        if not self._kvarn_tail_demotions:
-            return {}
-        demotions = {}
-        for req_id, lo, hi in self._kvarn_tail_demotions:
-            prev = demotions.get(req_id, (lo, lo))
-            demotions[req_id] = (min(prev[0], lo), max(prev[1], hi))
-        self._kvarn_tail_demotions.clear()
-        return demotions
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -906,9 +793,6 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self._kvarn_tail_start.pop(request.request_id, None)
-        self._kvarn_tail_ts_since.pop(request.request_id, None)
-        self._kvarn_prefix_len.pop(request.request_id, None)
         boundary_blocks = self._pop_boundary_blocks(request)
         self.block_pool.free_blocks(boundary_blocks)
         self.coordinator.free(request.request_id)
