@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from math import gcd
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
+import os
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -445,6 +447,72 @@ def _map_global_topk_to_gathered_ckv_kernel(
         gathered_slot,
         mask=valid,
     )
+
+
+def _t_stack(rows):
+    import torch as _t
+    return _t.stack(rows)
+
+
+def _dbg_dump_gather_selection(
+    num_tokens, selected_indices, active_counts, cache_seq_lens, attn_metadata,
+    raw_topk=None,
+) -> None:
+    """Env-gated one-shot dump of the gather-route extend selection."""
+    import torch as _t
+
+    last = num_tokens - 1
+    a = active_counts[:num_tokens]
+    sel_last = selected_indices[last, : int(a[last])].to(_t.int64)
+    g = attn_metadata.global_cache_seq_lens_per_req
+    cu = (
+        attn_metadata.dcp_local_cu_seq_lens.tolist()
+        if attn_metadata.dcp_local_cu_seq_lens is not None else None
+    )
+    print(
+        "[kvarn-gather-dbg] tokens=%d act[min/med/max]=%d/%d/%d "
+        "causal[last]=%d glob_seq=%s sel[last] n=%d min=%d max=%d "
+        "padded=%s local_cu=%s"
+        % (
+            num_tokens, int(a.min()), int(a.float().median()), int(a.max()),
+            int(cache_seq_lens[last]),
+            g[:1].tolist() if g is not None else None,
+            int(a[last]), int(sel_last.min()) if sel_last.numel() else -1,
+            int(sel_last.max()) if sel_last.numel() else -1,
+            getattr(attn_metadata, "dcp_padded_total_tokens", None),
+            cu,
+        ),
+        flush=True,
+    )
+    print(
+        "[kvarn-gather-dbg] head act[:24]=%s causal[:24]=%s causal[last:]=%s"
+        % (
+            a[:24].tolist(),
+            cache_seq_lens[:24].tolist(),
+            cache_seq_lens[max(0, num_tokens - 4): num_tokens].tolist(),
+        ),
+        flush=True,
+    )
+    if raw_topk is not None:
+        raw = raw_topk[last].to(_t.int64)
+        raw_valid = raw[raw >= 0]
+        print(
+            "[kvarn-gather-dbg] raw[last] n=%d min=%d max=%d top=%s"
+            % (
+                int(raw_valid.numel()),
+                int(raw_valid.min()) if raw_valid.numel() else -1,
+                int(raw_valid.max()) if raw_valid.numel() else -1,
+                sorted(raw_valid.tolist())[-8:],
+            ),
+            flush=True,
+        )
+    big = sel_last[sel_last > 1023]
+    if big.numel():
+        print(
+            f"[kvarn-gather-dbg] OOR slots n={int(big.numel())} "
+            f"vals={sorted(big.tolist())[:12]}",
+            flush=True,
+        )
 
 
 def _map_global_topk_to_gathered_ckv(
@@ -1029,7 +1097,20 @@ class B12xMLASparseMetadataBuilder(
             num_decode_tokens=metadata.num_decode_tokens,
             min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
             max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
-        ):
+        )
+        if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+            print(
+                "[kvarn-gather-gate] gate=%s tokens=%d decode=%d spec=%s "
+                "mql=%d enabled=%s glmnext=%s spec_dtype=%s" % (
+                    _gather_gate, num_tokens, metadata.num_decode_tokens,
+                    metadata.is_spec_decode, common.max_query_len,
+                    self._ckv_gather_requested,
+                    self.requires_glm_next_selector_metadata,
+                    getattr(self.kv_cache_spec, "cache_dtype_str", None),
+                ),
+                flush=True,
+            )
+        if _gather_gate:
             assert self.ckv_selected_indices_buffer is not None
             assert self.ckv_active_counts_buffer is not None
             assert self.dcp_rank_req_lens_buffer is not None
@@ -1561,15 +1642,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             if tail_mode:
                 # Precision-tail segment: dense always-attended window read
                 # by the fp8 arm; LSE is always required (two-launch merge).
+                # The fp8 arm lives on the decode kernel only, so the tail
+                # segment always launches decode mode; max_chunks_per_row=2
+                # is the body extend's split cap (keeps the extend_tail
+                # split-K scratch at ~268 MB, not rows x 64 chunks).
                 caps_kwargs.update(
                     model_type=int(self._module.ModelType.KVARN_TAIL_FP8),
                     scale_format=1,  # ScaleFormat.ARBITRARY_FP32 (GLM fp8)
                     max_width=self._kvarn_tail_local_tokens,
-                    max_chunks_per_row=max(
-                        1, (self._kvarn_tail_local_tokens + 63) // 64
-                    ),
                     cache_record_bytes=layout.record_bytes,
                     return_lse=True,
+                    mode="decode",
+                    num_q_heads=self._kernel_num_heads,
+                    max_chunks_per_row=2,
                 )
             else:
                 caps_kwargs.update(
@@ -1584,21 +1669,25 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         or self._kvarn_tail_local_tokens > 0
                     ),
                 )
-            if mode not in ("decode", "decode_tail"):
-                # KVarN extend runs on the decode kernel: the MG prefill
-                # kernel has no KVARN_DUAL arm (its bulk-record IO requires
-                # 16B-aligned records), and at 16 local q heads (= one head
-                # group) the decode kernel amortizes the same KV gather.
-                # 4096 rows saturate the SMs, so the split-K depth is tiny;
-                # the scratch is rows x chunks x heads x 512 x 2B and the
-                # uncapped chunk count (33) would over-provision it ~16x.
-                # The adaptive split config covers the full width with few
-                # chunks (the same contract as the body extend plan); for
-                # extend_tail this cap is what keeps the scratch at ~268 MB
-                # instead of rows x 64 chunks (~8.6 GB at 4096 rows).
-                caps_kwargs["mode"] = "decode"
+            if mode == "ckv_extend":
+                # The full-CKV gather route binds the tile-stride gathered
+                # arena (records + per-tile tail, mirroring the source pool),
+                # so one KV page equals one kernel tile: the decode kernel
+                # addresses records as block*tile_stride + row*record and
+                # every selected row lands at its true record offset. A flat
+                # (page, record) view shifts every tile past the first by
+                # its accumulated per-tile tails.
+                caps_kwargs["page_size"] = layout.group
+            if not tail_mode and mode in ("extend", "ckv_extend"):
+                # MG prefill runs the KVARN_DUAL arm (scalar record IO --
+                # the 536B-class row is 8B- not 16B-aligned -- with inline
+                # dequant): keep the extend mode and the DCP-global padded
+                # head width the forward pass binds (64 = four 16-head MG
+                # groups replicated across CTAs; mg_n_hg==1 keeps one group
+                # per CTA in smem), and keep the full chunk count
+                # (ceil(topk / 64); MG carries no split-K scratch).
                 caps_kwargs["num_q_heads"] = self._kernel_num_heads
-                caps_kwargs["max_chunks_per_row"] = 2
+                caps_kwargs.pop("decode_max_rows", None)
         if self._uses_nvfp4_cache:
             caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         caps = self._module.Caps(**caps_kwargs)
@@ -2410,48 +2499,171 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
         if local_tokens < padded_tokens:
             local_buffer[local_tokens:padded_tokens].zero_()
+        if os.environ.get("KVARN_GATHER_DEBUG") == "1" and local_tokens:
+            # Torch-side reference gather: pool rows via block_table, in
+            # local order. Diffs against what cp_gather_cache produced.
+            bt = attn_metadata.block_table[: attn_metadata.num_reqs]
+            cu = attn_metadata.dcp_local_cu_seq_lens[: attn_metadata.num_reqs + 1]
+            ref_rows = []
+            for req in range(attn_metadata.num_reqs):
+                beg, end = int(cu[req]), int(cu[req + 1])
+                for j in range(beg, end):
+                    pos = j - beg
+                    lb = pos // int(self._kernel_page_size)
+                    off = pos - lb * int(self._kernel_page_size)
+                    ref_rows.append(kv_cache[int(bt[req, lb]), off, :])
+            ref = _t_stack(ref_rows)
+            got = local_buffer[:local_tokens]
+            if ref.shape[0] == got.shape[0]:
+                diff = (ref.to(torch.uint8) != got).any(dim=1)
+                # Discriminating check: pool rows at the rank's TRUE owned
+                # global positions (interleave-aware) vs local positions.
+                itl = int(attn_metadata.cp_kv_cache_interleave_size)
+                ws = self.dcp_world_size
+                rank = group.rank_in_group
+                total = (
+                    int(attn_metadata.global_cache_seq_lens_per_req[0])
+                    if attn_metadata.global_cache_seq_lens_per_req is not None
+                    else 523
+                )
+                own = [t for t in range(total) if (t // itl) % ws == rank]
+                own = own[:local_tokens]
+                own_rows = []
+                for pos in own:
+                    lb = pos // int(self._kernel_page_size)
+                    own_rows.append(
+                        kv_cache[int(bt[0, lb]), pos - lb * int(self._kernel_page_size), :]
+                    )
+                ref_own = _t_stack(own_rows)
+                d_own = (ref_own.to(torch.uint8) != got).any(dim=1)
+                pz = [
+                    int((kv_cache[int(bt[0, p // int(self._kernel_page_size)]),
+                                  p % int(self._kernel_page_size)] == 0).all())
+                    for p in range(min(24, local_tokens))
+                ]
+                print(
+                    "[kvarn-gather-dbg] cp_gather: rows=%d mismatched=%d "
+                    "maxbyte=%d own_global_mismatched=%d "
+                    "pool_local_pos_zero[:24]=%s" % (
+                        local_tokens, int(diff.sum()),
+                        int((ref.to(torch.int16) - got.to(torch.int16)).abs().max()),
+                        int(d_own.sum()), pz,
+                    ),
+                    flush=True,
+                )
+        _dbg_xchg = None
+        if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+            lb = local_buffer[:padded_tokens].view(-1)
+            _dbg_xchg = torch.stack([
+                lb.to(torch.int64).sum(),
+                (lb.to(torch.int64) * torch.arange(1, lb.numel() + 1, device=lb.device)).sum(),
+            ])
+            _dbg_all = torch.zeros(
+                (self.dcp_world_size, 2), dtype=torch.int64, device=lb.device
+            )
+            _dcp_all_gather_current_stream(
+                group,
+                _dbg_xchg.view(-1),
+                _dbg_all.view(-1),
+            )
         _dcp_all_gather_current_stream(
             group,
             local_buffer[:padded_tokens].view(-1),
             staging[: self.dcp_world_size * padded_tokens].view(-1),
         )
-        # KVarN precision tail: rows the current chunks stored as fp8
-        # (positions >= ts per request, per rank segment) must read as
-        # kvarn in the single MG prefill launch. Demote the throwaway
-        # dense copies in place; the pool keeps the sliding fp8 window.
         if self._kvarn_tail_local_tokens > 0:
+            # KVarN precision tail: rows stored as fp8 (positions >= ts)
+            # STAY fp8 in the gathered copy — the extend tail launch reads
+            # them through the fp8 arm and merges with the body launch
+            # (design doc §10.4). The old throwaway-copy demote made the
+            # extend attention all-kvarn, which is why prefill-scored KLD
+            # never observed the tail. Debug: count surviving fp8 rows.
             ts = getattr(attn_metadata, "kvarn_tail_start", None)
-            if ts is not None:
-                from vllm.v1.attention.backends.mla.kvarn_tail import (
-                    kvarn_tail_demote_gathered,
+            if ts is not None and os.environ.get("KVARN_TAIL_DEBUG") and (
+                not torch.cuda.is_current_stream_capturing()
+            ):
+                rows_all = gathered_buffer[
+                    : self.dcp_world_size * padded_tokens
+                ].reshape(-1, self._cache_record_bytes)
+                n_fp8_dense = int(
+                    (rows_all[:, 520:528] != 0).any(-1).sum().item()
                 )
-
-                kvarn_tail_demote_gathered(
-                    gathered_buffer[: self.dcp_world_size * padded_tokens],
-                    attn_metadata.dcp_local_cu_seq_lens,
-                    ts[: attn_metadata.num_reqs],
-                    padded_tokens,
-                    self.dcp_world_size,
-                    self._kvarn_layout,
-                    interleave=int(attn_metadata.cp_kv_cache_interleave_size),
+                logger.warning(
+                    "KVARN_TAIL_DEBUG gather: rows=%d fp8_rows=%d "
+                    "ts=%s local_total=%d",
+                    int(rows_all.shape[0]),
+                    n_fp8_dense,
+                    ts[: attn_metadata.num_reqs].tolist(),
+                    int(attn_metadata.dcp_local_total_tokens),
                 )
-                if os.environ.get("KVARN_TAIL_DEBUG") and (
-                    not torch.cuda.is_current_stream_capturing()
-                ):
-                    rows_all = gathered_buffer[
-                        : self.dcp_world_size * padded_tokens
-                    ].reshape(-1, self._cache_record_bytes)
-                    n_fp8_dense = int(
-                        (rows_all[:, 520:528] != 0).any(-1).sum().item()
-                    )
-                    logger.warning(
-                        "KVARN_TAIL_DEBUG gather: rows=%d fp8_after_demote=%d "
-                        "ts=%s local_total=%d",
-                        int(rows_all.shape[0]),
-                        n_fp8_dense,
-                        ts[: attn_metadata.num_reqs].tolist(),
-                        int(attn_metadata.dcp_local_total_tokens),
-                    )
+        if _dbg_xchg is not None:
+            full = staging[: self.dcp_world_size * padded_tokens].view(-1)
+            row = full.to(torch.int64)
+            chk = torch.stack([
+                row.sum(), (row * torch.arange(1, row.numel() + 1, device=row.device)).sum(),
+            ])
+            ok0 = int(chk[0] == _dbg_all[group.rank_in_group][0])
+            ok1 = int(chk[1] == _dbg_all[group.rank_in_group][1])
+            other = 1 - group.rank_in_group
+            whole = staging[: self.dcp_world_size * padded_tokens].reshape(
+                self.dcp_world_size, padded_tokens, -1
+            ).to(torch.int64)
+            own_ok = int((whole[group.rank_in_group].sum() == _dbg_xchg[0]))
+            print(
+                "[kvarn-gather-dbg] xchg rank=%d own_sum_ok=%d own_wsum_ok=%d "
+                "local_sum=%d post_sum=%d remote_sum=%d expect_remote=%d" % (
+                    group.rank_in_group, ok0, ok1, int(_dbg_xchg[0]),
+                    int(whole[group.rank_in_group].sum()),
+                    int(whole[other].sum()), int(_dbg_all[other][0]),
+                ),
+                flush=True,
+            )
+        if self._uses_kvarn_cache:
+            # Mirror the pool's tile geometry into the arena: the decode
+            # kernel addresses block*stride + tile*tile_stride + row*record
+            # from plan constants; with page == tile for the gathered cache
+            # every selected row lands at its true record offset.
+            layout = self._kvarn_layout
+            tile_tokens = int(layout.group)
+            record = self._cache_record_bytes
+            tile_stride = int(layout.tile_stride_bytes)
+            used_rows = self.dcp_world_size * padded_tokens
+            tiles = used_rows // tile_tokens
+            staging_bytes = capacity_rows * record
+            arena = gathered_buffer[staging_bytes:].as_strided(
+                (tiles, tile_tokens, record), (tile_stride, record, 1)
+            )
+            if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+                _sh = staging[:12]
+                print(
+                    "[kvarn-gather-dbg] staging-head zeros=%d/%d "
+                    "staging_ptr=%#x arena_ptr=%#x gbuf_ptr=%#x "
+                    "cap_rows=%d padded=%d local=%d"
+                    % (
+                        int((_sh == 0).all(dim=1).sum()), _sh.shape[0],
+                        staging.data_ptr(), arena.data_ptr(),
+                        gathered_buffer.data_ptr(), capacity_rows,
+                        padded_tokens, local_tokens,
+                    ),
+                    flush=True,
+                )
+                _stg_snap = staging[:2048].clone()
+                self._dbg_stg_snap = _stg_snap
+            arena.view(tiles, tile_tokens * record).copy_(
+                staging[:used_rows].view(tiles, tile_tokens * record)
+            )
+            if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+                self._dbg_postcopy = arena.reshape(-1, record)[:24].clone()
+            # The per-tile tail sits AFTER the tile's records (tile_base +
+            # tile_tokens*record .. +tile_stride); zero it every gather so
+            # stale workspace bytes never dequantize into garbage scales.
+            gathered_buffer[
+                staging_bytes + tile_tokens * record:
+            ].as_strided(
+                (tiles, tile_stride - tile_tokens * record),
+                (tile_stride, 1),
+            ).zero_()
+            return arena
         return gathered_buffer.view(
             -1, self._kernel_page_size, self._cache_record_bytes
         )
@@ -2565,6 +2777,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 attn_metadata,
                 gathered_buffer,
             )
+            if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+                print(
+                    "[kvarn-gather-dbg] pool shape=%s strides=%s dtype=%s"
+                    % (
+                        tuple(kv_c_and_k_pe_cache.shape),
+                        tuple(kv_c_and_k_pe_cache.stride()),
+                        kv_c_and_k_pe_cache.dtype,
+                    ),
+                    flush=True,
+                )
             assert attn_metadata.ckv_selected_indices is not None
             assert attn_metadata.ckv_active_counts is not None
             assert attn_metadata.dcp_rank_req_starts is not None
@@ -2593,6 +2815,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             ).contiguous()
             torch.minimum(active_counts, cache_seq_lens, out=active_counts)
             _mask_page_table_after_nsa_len(selected_indices, active_counts)
+            _dbg_postcopy = getattr(self, "_dbg_postcopy", None)
+            if _dbg_postcopy is not None:
+                _ar0 = kv_cache_for_run.reshape(-1, 536)[:24]
+                _z0 = (_ar0 == 0).all(dim=1)
+                _d0 = (_ar0 != _dbg_postcopy).any(dim=1)
+                print(
+                    "[kvarn-gather-dbg] phase=post-map zero_rows=%d "
+                    "changed_vs_postcopy=%d first_changed=%s"
+                    % (int(_z0.sum()), int(_d0.sum()),
+                       _d0.nonzero().flatten()[:6].tolist()),
+                    flush=True,
+                )
+            if os.environ.get("KVARN_GATHER_DEBUG") == "1":
+                _dbg_dump_gather_selection(
+                    num_tokens, selected_indices, active_counts,
+                    cache_seq_lens, attn_metadata, raw_topk=topk_indices,
+                )
         else:
             physical_selection = (
                 self._physical_selection_provider.get_b12x_physical_selection(
@@ -2657,6 +2896,33 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 cache_seq_lens = attn_metadata.seq_lens[
                     : attn_metadata.num_reqs
                 ].contiguous()
+        if (
+            os.environ.get("KVARN_GATHER_DEBUG") == "1"
+            and num_tokens > 0
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _qh = q_all.float().sum(dim=(0, 2))
+            _r0 = q_all[0].float().sum(dim=1)
+            _qr = (
+                q[0].float().sum(dim=1)
+                if not isinstance(q, tuple) else q[0][0].float().sum(dim=1)
+            )
+            print(
+                "[kvarn-gather-dbg] qsum route=%s rows=%d heads=%d "
+                "first8=%s last8=%s total=%.6e row0_8=%s row0_all=%.6e "
+                "raw0_8=%s raw0_all=%.6e"
+                % (
+                    plan_key[0], num_tokens, int(q_all.shape[1]),
+                    [round(float(x), 3) for x in _qh[:8].tolist()],
+                    [round(float(x), 3) for x in _qh[-8:].tolist()],
+                    float(_qh.sum()),
+                    [round(float(x), 3) for x in _r0[:8].tolist()],
+                    float(_r0.sum()),
+                    [round(float(x), 3) for x in _qr[:8].tolist()],
+                    float(_qr.sum()),
+                ),
+                flush=True,
+            )
         binding = self._bind(
             plan,
             scratch=scratch,
@@ -2744,6 +3010,71 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             output = _packed_heads(output, input_num_heads)
             if lse is not None:
                 lse = _packed_heads(lse, input_num_heads)
+        if (
+            os.environ.get("KVARN_GATHER_DEBUG") == "1"
+            and num_tokens > 0
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _o0 = output[0].float().sum(dim=1)
+            _oa = output.float().sum(dim=(0, 2))
+            _rowsum = output.float().sum(dim=(1, 2)).abs()
+            _nz = (_rowsum > 0).nonzero().flatten()
+            _stg_snap = getattr(self, "_dbg_stg_snap", None)
+            _postcopy = getattr(self, "_dbg_postcopy", None)
+            if _stg_snap is not None and _postcopy is not None:
+                def _ph(tag, ref):
+                    _ar = kv_cache_for_run.reshape(-1, 536)[:24]
+                    _z = (_ar == 0).all(dim=1)
+                    _d = (_ar != ref).any(dim=1)
+                    print(
+                        "[kvarn-gather-dbg] phase=%s zero_rows=%d "
+                        "changed_vs_postcopy=%d first_changed=%s"
+                        % (tag, int(_z.sum()), int(_d.sum()),
+                           _d.nonzero().flatten()[:6].tolist()),
+                        flush=True,
+                    )
+                _ar = kv_cache_for_run.reshape(-1, 536)[:24]
+                _ph("pre-map", _postcopy)
+                torch.cuda.synchronize()
+            if num_tokens > 100 and not os.path.exists(
+                "/tmp/kvarn-launch-capture.pt"
+            ):
+                try:
+                    torch.save(
+                        {
+                            "q": q_all[:24].cpu(),
+                            "sel": selected_indices[:24].cpu(),
+                            "act": active_counts[:24].cpu(),
+                            "lens": cache_seq_lens[:24].cpu(),
+                            "arena_head": (
+                                kv_cache_for_run.reshape(-1)[: 2 * 143616].cpu()
+                                if kv_cache_for_run.dtype == torch.uint8
+                                else None
+                            ),
+                            "arena_shape": tuple(kv_cache_for_run.shape),
+                            "arena_strides": tuple(kv_cache_for_run.stride()),
+                            "arena_dtype": str(kv_cache_for_run.dtype),
+                            "out_head": output[:24].cpu(),
+                        },
+                        "/tmp/kvarn-launch-capture.pt",
+                    )
+                except Exception as _e:
+                    print("[kvarn-gather-dbg] capture save failed:", _e,
+                          flush=True)
+            print(
+                "[kvarn-gather-dbg] osum route=%s rows=%d heads=%d "
+                "o_row0_8=%s o_row0_all=%.6e o_head_total8=%s "
+                "zero_rows=%d first_nz=%s last_nz=%d"
+                % (
+                    plan_key[0], num_tokens, int(output.shape[1]),
+                    [round(float(x), 3) for x in _o0[:8].tolist()],
+                    float(_o0.sum()),
+                    [round(float(x), 3) for x in _oa[:8].tolist()],
+                    int((_rowsum == 0).sum()),
+                    _nz[:5].tolist(), int(_nz[-1]) if _nz.numel() else -1,
+                ),
+                flush=True,
+            )
         if self.need_to_return_lse_for_decode:
             assert lse is not None
             return output, lse
