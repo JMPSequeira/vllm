@@ -13,10 +13,11 @@ Run: CUDA_VISIBLE_DEVICES=2 ~/lil/vllm/.venv/bin/python tests/kvarn_ab_math.py
 
 import math
 import sys
+from pathlib import Path
 
 import torch
 
-sys.path.insert(0, "/home/js/lil/vllm")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vllm.v1.attention.ops.kvarn_mla import (  # noqa: E402
     KvarnMlaLayout,
     hadamard_matrix,

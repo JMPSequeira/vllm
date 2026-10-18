@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 import os
 
+# Root directory for KVARN_GATHER_DEBUG dumps and captures.
+_KVAR_DBG_DIR = os.environ.get("KVARN_GATHER_DEBUG_DIR", "/tmp/kvarn-gather-debug")
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -1245,7 +1248,7 @@ class B12xMLASparseMetadataBuilder(
             if _hb is not None:
                 try:
                     with open(
-                        "/home/js/kvarn-probes/kvtailbuild-r0.log", "a"
+                        _KVAR_DBG_DIR + "/kvtailbuild-r0.log", "a"
                     ) as _f:
                         _f.write(
                             "replay=%d idx_sum=%d len_sum=%d csl_sum=%d "
@@ -2500,7 +2503,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 "pool_recs": _prec,
                                 "latents": kv_c_normed[_pr].detach().clone().cpu(),
                             },
-                            f"/home/js/kvarn-probes/kvarn-stage{_sl_seq}-poststore-r{self.dcp_rank}.pt",
+                            f_KVAR_DBG_DIR + "/kvarn-stage{_sl_seq}-poststore-r{self.dcp_rank}.pt",
                         )
                 except Exception as _e:
                     logger.warning("stage store probe failed %s", _e)
@@ -2510,7 +2513,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     os.environ.get("KVARN_TAIL_DEBUG")
                     and not torch.cuda.is_current_stream_capturing()
                     and not os.path.exists(
-                        f"/home/js/kvarn-probes/kvarn-demote-capture-r{self.dcp_rank}.pt"
+                        f_KVAR_DBG_DIR + "/kvarn-demote-capture-r{self.dcp_rank}.pt"
                     )
                 ):
                     _dr = demote_ranges[: attn_metadata.num_reqs]
@@ -2606,7 +2609,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                     attn_metadata.cp_kv_cache_interleave_size
                                 ),
                             },
-                            f"/home/js/kvarn-probes/kvarn-demote-capture-r{self.dcp_rank}.pt",
+                            f_KVAR_DBG_DIR + "/kvarn-demote-capture-r{self.dcp_rank}.pt",
                         )
                         logger.warning("KVARN_TAIL_DEBUG: demote capture saved")
                     except Exception as _e:
@@ -2675,7 +2678,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     boundary is not None
                     and int(boundary.max()) > 0
                     and not os.path.exists(
-                        f"/home/js/kvarn-probes/kvarn-pool-dump-r{self.dcp_rank}.pt"
+                        f_KVAR_DBG_DIR + "/kvarn-pool-dump-r{self.dcp_rank}.pt"
                     )
                     and attn_metadata.num_prefills > 0
                 ):
@@ -2721,7 +2724,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                     else None
                                 ),
                             },
-                            f"/home/js/kvarn-probes/kvarn-pool-dump-r{self.dcp_rank}.pt",
+                            f_KVAR_DBG_DIR + "/kvarn-pool-dump-r{self.dcp_rank}.pt",
                         )
                         logger.warning("KVARN_TAIL_DEBUG: pool dump saved")
                     except Exception as _e:
@@ -2744,7 +2747,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 _csl_t = attn_metadata.cache_seq_lens_per_token[:num_tokens]
                 try:
                     with open(
-                        f"/home/js/kvarn-probes/kvtailhash-r{self.dcp_rank}.log",
+                        f_KVAR_DBG_DIR + "/kvtailhash-r{self.dcp_rank}.log",
                         "a",
                     ) as _f:
                         _f.write(
@@ -2923,13 +2926,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             "ref_rows": _ref,
                             "pool_shape": tuple(_kcache_u8.shape),
                         },
-                        f"/home/js/kvarn-probes/kvarn-stage{_gl_seq}-postgatherlocal-r{group.rank_in_group}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-stage{_gl_seq}-postgatherlocal-r{group.rank_in_group}.pt",
                     )
             except Exception as _e:
                 logger.warning("stage postgatherlocal probe failed %s", _e)
         if os.environ.get("KVARN_TAIL_DEBUG") and (
             50_000_000 < gathered_buffer.numel() < 100_000_000
-            and not os.path.exists(f"/home/js/kvarn-probes/kvarn-prexchg-{os.getpid()}.pt")
+            and not os.path.exists(f_KVAR_DBG_DIR + "/kvarn-prexchg-{os.getpid()}.pt")
         ):
             # Split gather-vs-exchange: the dense gather's output before the
             # NCCL all-gather. LOGICAL rows of the tile-strided arena.
@@ -2947,7 +2950,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         "local_tokens": int(local_tokens),
                         "padded": int(padded_tokens),
                     },
-                    f"/home/js/kvarn-probes/kvarn-prexchg-{os.getpid()}.pt",
+                    f_KVAR_DBG_DIR + "/kvarn-prexchg-{os.getpid()}.pt",
                 )
             except Exception as _e:
                 logger.warning("prexchg probe failed %s", _e)
@@ -3111,7 +3114,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             if (
                 os.environ.get("KVARN_TAIL_DEBUG")
                 and not os.path.exists(
-                    f"/home/js/kvarn-probes/kvarn-stg-dump-r{group.rank_in_group}.pt"
+                    f_KVAR_DBG_DIR + "/kvarn-stg-dump-r{group.rank_in_group}.pt"
                 )
             ):
                 _ts_g = getattr(attn_metadata, "kvarn_tail_start", None)
@@ -3140,7 +3143,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 "tile_stride": tile_stride,
                                 "record": record,
                             },
-                            f"/home/js/kvarn-probes/kvarn-stg-dump-r{group.rank_in_group}.pt",
+                            f_KVAR_DBG_DIR + "/kvarn-stg-dump-r{group.rank_in_group}.pt",
                         )
                         logger.warning("KVARN_TAIL_DEBUG: staging dump saved")
                     except Exception as _e:
@@ -3174,7 +3177,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 "rows_idx": _rows,
                                 "rows": _ar2[_rows].cpu().contiguous(),
                             },
-                            f"/home/js/kvarn-probes/kvarn-stage{_pz_seq}-postgather-r{group.rank_in_group}.pt",
+                            f_KVAR_DBG_DIR + "/kvarn-stage{_pz_seq}-postgather-r{group.rank_in_group}.pt",
                         )
                 except Exception as _e:
                     logger.warning("stage postgather probe failed %s", _e)
@@ -3227,7 +3230,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             # One-shot per-rank capture: the MODEL's q before staging and the
             # workspace q after it, plus segment pointers. Distinguishes
             # model-side NaN from workspace-side corruption.
-            _qp = f"/home/js/kvarn-probes/kvarn-qprobe-r{self.dcp_rank}.pt"
+            _qp = f_KVAR_DBG_DIR + "/kvarn-qprobe-r{self.dcp_rank}.pt"
             if not os.path.exists(_qp):
                 try:
                     _src = q[0] if isinstance(q, tuple) else q
@@ -3261,7 +3264,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             q_all[:, input_num_heads:].zero_()
 
         if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
-            _qp = f"/home/js/kvarn-probes/kvarn-qprobe-r{self.dcp_rank}.pt"
+            _qp = f_KVAR_DBG_DIR + "/kvarn-qprobe-r{self.dcp_rank}.pt"
             if not os.path.exists(_qp):
                 try:
                     torch.cuda.synchronize()
@@ -3514,7 +3517,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     _rl = list(range(760, 790)) + list(range(2810, 2830))
                     _kvarn_dbg_save({"rows": _ar_l[_rl].cpu().contiguous(),
                                 "rows_idx": _rl},
-                               f"/home/js/kvarn-probes/kvarn-layer{_ql}-prebody-r{self.dcp_rank}.pt")
+                               f_KVAR_DBG_DIR + "/kvarn-layer{_ql}-prebody-r{self.dcp_rank}.pt")
                 except Exception as _e:
                     logger.warning("layer prebody probe failed %s", _e)
         result = self._run(binding)
@@ -3528,7 +3531,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 _rl2 = list(range(760, 790)) + list(range(2810, 2830))
                 _kvarn_dbg_save({"rows": _ar_l2[_rl2].cpu().contiguous(),
                             "rows_idx": _rl2},
-                           f"/home/js/kvarn-probes/kvarn-layer{_ql}-postbody-r{self.dcp_rank}.pt")
+                           f_KVAR_DBG_DIR + "/kvarn-layer{_ql}-postbody-r{self.dcp_rank}.pt")
                 _ob = output.detach().clone().cpu()
                 _kvarn_dbg_save({
                             "out_rows": _ob[1520:1570],
@@ -3537,12 +3540,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                 if bool(torch.isnan(_ob[1520 + i].float()).any())
                             ],
                         },
-                       f"/home/js/kvarn-probes/kvarn-layer{_ql}-bodyout-r{self.dcp_rank}.pt")
+                       f_KVAR_DBG_DIR + "/kvarn-layer{_ql}-bodyout-r{self.dcp_rank}.pt")
                 _KVAR_DBG_SEQ = _ql + 1
             except Exception as _e:
                 logger.warning("layer postbody probe failed %s", _e)
         if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
-            _qp2 = f"/home/js/kvarn-probes/kvarn-qprobe-postbody-r{self.dcp_rank}.pt"
+            _qp2 = f_KVAR_DBG_DIR + "/kvarn-qprobe-postbody-r{self.dcp_rank}.pt"
             if not os.path.exists(_qp2):
                 try:
                     torch.cuda.synchronize()
@@ -3556,7 +3559,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             "rows_idx": _rows,
                             "rows": _ar_post[_rows].cpu(),
                         },
-                        f"/home/js/kvarn-probes/kvarn-arena-postbody-{os.getpid()}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-arena-postbody-{os.getpid()}.pt",
                     )
                 except Exception as _e:
                     logger.warning("KVARN_TAIL_QPROBE arena-postbody failed %s", _e)
@@ -3750,7 +3753,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 selected_lengths=tail_lengths,
             )
             if os.environ.get("KVARN_TAIL_QPROBE") == "1" and plan_key[0] == "ckv_extend" and num_tokens > 1000:
-                _tp = f"/home/js/kvarn-probes/kvarn-tailviews-r{self.dcp_rank}.pt"
+                _tp = f_KVAR_DBG_DIR + "/kvarn-tailviews-r{self.dcp_rank}.pt"
                 if not os.path.exists(_tp):
                     try:
                         _rt = getattr(tail_binding, "runtime", tail_binding)
@@ -3774,7 +3777,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 and not torch.cuda.is_current_stream_capturing()
                 and plan_key[0] == "ckv_extend"
                 and tail_lens_real.max().item() > 0
-                and not os.path.exists("/home/js/kvarn-probes/kvarn-mid-probe.pt")
+                and not os.path.exists(_KVAR_DBG_DIR + "/kvarn-mid-probe.pt")
             ):
                 try:
                     _ar = kv_cache_for_run.reshape(-1, self._cache_record_bytes)
@@ -3785,7 +3788,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             "pid": os.getpid(),
                             "arena_ptr": int(kv_cache_for_run.data_ptr()),
                         },
-                        f"/home/js/kvarn-probes/kvarn-mid-{os.getpid()}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-mid-{os.getpid()}.pt",
                     )
                     logger.warning("KVARN_TAIL_DEBUG: mid probe saved")
                 except Exception as _e:
@@ -3805,7 +3808,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     _kvarn_dbg_save(
                         {"pid": os.getpid(), "rows_idx": _rows_t,
                          "rows": _pre_tail},
-                        f"/home/js/kvarn-probes/kvarn-stage{_pt_seq}-pretail-r{self.dcp_rank}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-stage{_pt_seq}-pretail-r{self.dcp_rank}.pt",
                     )
                 except Exception as _e:
                     logger.warning("pretail probe failed %s", _e)
@@ -3820,7 +3823,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 and plan_key[0] == "decode"
                 and tail_lens_real.max().item() > 100
                 and not os.path.exists(
-                    f"/home/js/kvarn-probes/kvarn-decodecap-r{self.dcp_rank}.pt"
+                    f_KVAR_DBG_DIR + "/kvarn-decodecap-r{self.dcp_rank}.pt"
                 )
             ):
                 # One-shot decode-tail capture (MTP bug hunt): the decode
@@ -3854,14 +3857,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     # id, the launch state is already on disk.
                     _kvarn_dbg_save(
                         _cap,
-                        f"/home/js/kvarn-probes/kvarn-decodecap-r{self.dcp_rank}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-decodecap-r{self.dcp_rank}.pt",
                     )
                     _cap["tail_rows"] = _ar_d[
                         tail_indices.clamp(0, _ar_d.shape[0] - 1)
                     ].cpu()
                     _kvarn_dbg_save(
                         _cap,
-                        f"/home/js/kvarn-probes/kvarn-decodecap-r{self.dcp_rank}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-decodecap-r{self.dcp_rank}.pt",
                     )
                     logger.warning("KVARN_TAIL_DEBUG: decodecap saved r%d", self.dcp_rank)
                 except Exception as _e:
@@ -3878,7 +3881,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     _kvarn_dbg_save(
                         {"pid": os.getpid(), "rows_idx": _rows_t2,
                          "rows": _ar_t2[_rows_t2].cpu().contiguous()},
-                        f"/home/js/kvarn-probes/kvarn-stage{_pt2_seq}-posttail-r{self.dcp_rank}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-stage{_pt2_seq}-posttail-r{self.dcp_rank}.pt",
                     )
                 except Exception as _e:
                     logger.warning("posttail probe failed %s", _e)
@@ -3926,7 +3929,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             "premerge_out": output[_pr].cpu(),
                             "dbg_ext_count": self._dbg_ext_count,
                         },
-                        "/home/js/kvarn-probes/kvarn-extcap-L6tail-r0.pt",
+                        _KVAR_DBG_DIR + "/kvarn-extcap-L6tail-r0.pt",
                     )
                     logger.warning(
                         "KVARN_TAIL_DEBUG: ext capture %d saved",
@@ -3969,7 +3972,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                         or torch.isinf(_mg[1520 + i]).any())
                             ],
                         },
-                        f"/home/js/kvarn-probes/kvarn-mergecap-L6tail-r{self.dcp_rank}.pt",
+                        f_KVAR_DBG_DIR + "/kvarn-mergecap-L6tail-r{self.dcp_rank}.pt",
                     )
                 except Exception as _e:
                     logger.warning("merge cap failed %s", _e)
