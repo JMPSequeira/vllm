@@ -776,6 +776,8 @@ class B12xMLASparseMetadataBuilder(
             (self.requires_glm_next_selector_metadata or self._is_glm_dsa)
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
+            and get_kv_quant_mode(self.kv_cache_spec.cache_dtype_str)
+            == KVQuantMode.KVARN_MLA
         )
         if self._ckv_gather_requested:
             # GLM DSA selects index_topk tokens; GLM5Next appends its
@@ -942,11 +944,22 @@ class B12xMLASparseMetadataBuilder(
             # safe under async scheduling, and this buffer's address is what
             # a captured FULL graph replays against. The CPU-staged fallback
             # below rewrites its pinned source on every build, which races a
-            # still-pending replay under async scheduling -- fatal for the
-            # kvarn tail, whose dense window consumes every length.
+            # still-pending replay under async scheduling.
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
-            per_token_lens.copy_(common.positions[:num_tokens])
-            per_token_lens += 1
+            if use_dcp:
+                # DCP cache lengths are rank-local; convert the global
+                # position+1 lengths on-device (no CPU staging).
+                per_token_lens.copy_(
+                    get_dcp_local_seq_lens(
+                        common.positions[:num_tokens] + 1,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+                )
+            else:
+                per_token_lens.copy_(common.positions[:num_tokens])
+                per_token_lens += 1
         else:
             starts = np.asarray(common.query_start_loc_cpu, dtype=np.int32)
             query_lens = np.diff(starts)
@@ -1000,14 +1013,9 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
                 prefill_start : prefill_start + metadata.num_prefills
             ].clone()
-        _gather_gate = (
-            get_kv_quant_mode(self.kv_cache_spec.cache_dtype_str)
-            == KVQuantMode.KVARN_MLA
-        ) and _use_b12x_full_ckv_gather(
+        _gather_gate = _use_b12x_full_ckv_gather(
             enabled=self._ckv_gather_requested,
             is_glm_next=self.requires_glm_next_selector_metadata,
-            # GLM DSA gathers only in eager prefill: captured graphs and
-            # speculative verification keep the query exchange.
             is_glm_dsa=self._is_glm_dsa and not for_cudagraph_capture,
             is_spec_decode=metadata.is_spec_decode,
             dcp_world_size=self.dcp_world_size,
@@ -1345,6 +1353,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._concat_and_cache_nvfp4_mla_fp8_rope = None
         self._concat_and_cache_glm_next_mla = None
         if self._uses_kvarn_cache:
+            if not self._is_glm_next:
+                raise ValueError(
+                    "B12X kvarn_mla_* KV cache requires the GLM5Next architecture."
+                )
             self._model_type = int(module.ModelType.KVARN_MLA)
             self._concat_and_cache_glm_next_mla_kvarn = (
                 module.concat_and_cache_glm_next_mla_kvarn
@@ -1396,6 +1408,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             (self._is_glm_next or self._is_glm_dsa)
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
+            and self._uses_kvarn_cache
         )
         max_ckv_tokens = envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS
         cp_kv_cache_interleave_size = int(
@@ -1468,11 +1481,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         """
         caps_kwargs = dict(
             device=torch.device("cuda", torch.accelerator.current_device_index()),
-            num_q_heads=(
-                _round_up_heads(self.num_heads)
-                if mode == "ckv_extend"
-                else self._kernel_num_heads
-            ),
+            num_q_heads=self._kernel_num_heads,
             max_q_rows=rows,
             max_width=self._topk_tokens,
             softmax_scale=self.scale,
@@ -1558,7 +1567,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         # -- so the prepared launcher compiles for the arena's address
         # contract, not the source pool's.
         kv_cache = self._bound_kv_cache
-        if self._uses_kvarn_cache and int(caps.page_size) == self._kvarn_layout.group:
+        if (
+            self._uses_kvarn_cache
+            and self._ckv_gather_enabled
+            and caps is self._plan_caps.get(("ckv_extend", self._max_tokens))
+        ):
             kv_cache = self._ckv_arena_probe()
         selected = torch.zeros(
             (rows, int(caps.max_width)), dtype=torch.int32, device=caps.device
