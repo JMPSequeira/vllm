@@ -519,6 +519,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "kvarn_mla_k5v5_g256",
         "kvarn_mla_k5v4_g256",
         "kvarn_mla_k4v2_g256",
+        "kvarn_mla_k4_g256",
     ]
 
     @staticmethod
@@ -582,6 +583,11 @@ class B12xMLASparseBackend(AttentionBackend):
             spec,
             state_content_bytes=record_bytes,
             alignment=_GLM_NEXT_INDEX_PAGE_BYTES,
+            # The GLM pooled indexer addresses the FP8 index tail through the
+            # parent-page stride and requires it to be a whole number of C4
+            # index pages (8448B); declare it so the pool stride is rounded
+            # for every grouping path, not just the split-page one.
+            block_stride_alignment=_GLM_NEXT_INDEX_PAGE_BYTES,
             page_tail_bytes_per_token=page_tail,
             model_version="glm5_next",
         )

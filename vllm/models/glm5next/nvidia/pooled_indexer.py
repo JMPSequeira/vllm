@@ -51,10 +51,12 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
-# KVarN dual-rate record widths (unambiguous vs the 528/304 GLM_NEXT dense
-# records); the kvarn kernels tile the cache at tile_stride rather than
-# densely, which moves the FP8 index tail offset (see _index_cache_view).
-_KVARN_RECORD_BYTES = (536, 600, 648, 400)
+# KVarN dual-rate / single-plane record widths (unambiguous vs the 528/304
+# GLM_NEXT dense records); the kvarn kernels tile the cache at tile_stride
+# rather than densely, which moves the FP8 index tail offset (see
+# _index_cache_view). Single-plane records (% 33 == 0) end exactly on the C4
+# boundary and carry no tile-tail data, so their reserved tail is zero.
+_KVARN_RECORD_BYTES = (536, 600, 648, 400, 264)
 _KVARN_TILE_TAIL_BYTES = 6400
 
 
@@ -347,8 +349,13 @@ class Glm5NextPooledIndexer(nn.Module):
             # parent page is subpages_per_parent * tile_stride. Placing the
             # FP8 index tail at the dense span put it inside the last tiles'
             # records, and record writes clobbered it (selection degraded
-            # with context length).
-            tile_stride = (256 * record_bytes + _KVARN_TILE_TAIL_BYTES
+            # with context length). Single-plane records (record % 33 == 0)
+            # end exactly on the C4 boundary: zero reserved tail, the index
+            # tail starts flush.
+            tile_tail = (
+                0 if record_bytes % 33 == 0 else _KVARN_TILE_TAIL_BYTES
+            )
+            tile_stride = (256 * record_bytes + tile_tail
                            + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES * _INDEX_PAGE_BYTES
             semantic_page_bytes = subpages_per_parent * tile_stride
         else:
@@ -361,7 +368,9 @@ class Glm5NextPooledIndexer(nn.Module):
             raise ValueError("GLM MLA cache page does not contain its FP8 index tail")
         if parent_stride_bytes % _INDEX_PAGE_BYTES:
             raise ValueError(
-                "GLM MLA parent-page stride must be an exact number of C4 pages"
+                "GLM MLA parent-page stride must be an exact number of C4 pages; "
+                f"shape={tuple(main_cache.shape)} strides={tuple(main_cache.stride())} "
+                f"parent_stride_bytes={parent_stride_bytes}"
             )
         parent_stride_pages = parent_stride_bytes // _INDEX_PAGE_BYTES
         max_virtual_page = (pages - 1) * parent_stride_pages + subpages_per_parent - 1
