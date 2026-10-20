@@ -21,6 +21,7 @@ DTYPES = [
     "kvarn_mla_k4v4_g256",
     "kvarn_mla_k5v5_g256",
     "kvarn_mla_k4v2_g256",
+    "kvarn_mla_k4_g256",
 ]
 
 
@@ -33,8 +34,12 @@ def test_dtype_dispatch(dtype: str):
             k_bits=layout.k_bits, v_bits=layout.v_bits, group=layout.group
         ).record_bytes
     )
-    # Mod-33 rule: 0 < r % 33 <= 21 (reserved per-tile tail fits the C4 gap).
-    assert 0 < layout.record_bytes % 33 <= 21
+    # Mod-33 rule: dual variants keep 0 < r % 33 <= 21 (reserved per-tile
+    # tail fits the C4 gap); single-plane variants end on the C4 boundary.
+    if layout.v_bits == 0:
+        assert layout.record_bytes % 33 == 0
+    else:
+        assert 0 < layout.record_bytes % 33 <= 21
     # Offsets must be non-overlapping, ordered, inside the record.
     offs = [
         layout.k_code_offset,
@@ -56,6 +61,7 @@ def test_record_widths():
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256").record_bytes == 536
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k5v5_g256").record_bytes == 648
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v2_g256").record_bytes == 400
+    assert kvarn_mla_layout_from_dtype("kvarn_mla_k4_g256").record_bytes == 264
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -109,6 +115,33 @@ def test_pack_unpack_parity(dtype: str):
         assert rel < 0.12, f"value-path relative error too high: {rel:.4f}"
     else:  # 2-bit value path
         assert rel < 0.65, f"value-path relative error too high: {rel:.4f}"
+
+
+def test_single_plane_shared_code():
+    """Single-plane (v_bits=0): one RTN grid, both paths read k_hat; the
+    stored k-plane is bit-identical to the dual k4v4 record's k-plane."""
+    single = kvarn_mla_layout_from_dtype("kvarn_mla_k4_g256")
+    dual = kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256")
+    gen = torch.Generator(device="cpu").manual_seed(4)
+    latent = torch.randn(64, single.latent_dim, generator=gen)
+
+    rec_s = pack_kvarn_mla_records(latent, single)
+    rec_d = pack_kvarn_mla_records(latent, dual)
+    k_s, v_s = unpack_kvarn_mla_records(rec_s, single)
+    k_d, _ = unpack_kvarn_mla_records(rec_d, dual)
+    # Same grid/bits on the k plane -> identical dequantized codes.
+    assert torch.equal(k_s, k_d)
+    # The value path reads the shared k_hat.
+    assert torch.equal(v_s, k_s)
+    # Reserved v_scale/v_zp fields are zero.
+    assert int(rec_s[:, single.v_scale_offset : single.v_zp_offset + 2].sum()) == 0
+    # Geometry: 256B codes + 8B footer, records end exactly on the C4
+    # boundary (264 = 8 C4 pages); no per-tile slack, index tail flush.
+    assert single.record_bytes == 264
+    assert single.record_bytes % 33 == 0
+    assert single.tile_stride_bytes == 8 * 8448
+    assert single.page_tail_bytes_per_token == 33
+    assert single.page_size_bytes == 9 * 8448
 
 
 def test_pack_unpack_vs_fp16_reference_cosine():

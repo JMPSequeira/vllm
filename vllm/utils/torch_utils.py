@@ -56,6 +56,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "kvarn_mla_k5v5_g256": torch.uint8,
     "kvarn_mla_k5v4_g256": torch.uint8,
     "kvarn_mla_k4v2_g256": torch.uint8,
+    "kvarn_mla_k4_g256": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {

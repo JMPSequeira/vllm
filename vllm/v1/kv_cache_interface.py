@@ -128,8 +128,12 @@ def parse_kvarn_mla_dtype(
 ) -> tuple[int, int, int] | None:
     """Parse a ``kvarn_mla_k<k>[v<v>]_g<group>`` dtype string.
 
-    Returns ``(k_bits, v_bits, group)`` where ``v_bits == k_bits`` for the
-    single-rate form, or ``None`` when the string is not a kvarn MLA dtype.
+    Returns ``(k_bits, v_bits, group)``. The single-rate form
+    (``kvarn_mla_k4_g256``) is the SINGLE-PLANE variant: ``v_bits == 0``
+    marks one shared code plane (one RTN grid, one inline fp16 scale +
+    zero-point) consumed by both the score (K) and value (V) paths through
+    their folded projections. Returns ``None`` when the string is not a
+    kvarn MLA dtype.
     """
     match = (
         _KVARN_MLA_DTYPE_RE.fullmatch(kv_cache_dtype)
@@ -139,7 +143,7 @@ def parse_kvarn_mla_dtype(
     if match is None:
         return None
     k_bits = int(match["k_bits"])
-    v_bits = int(match["v_bits"]) if match["v_bits"] else k_bits
+    v_bits = int(match["v_bits"]) if match["v_bits"] else 0
     return k_bits, v_bits, int(match["group"])
 
 

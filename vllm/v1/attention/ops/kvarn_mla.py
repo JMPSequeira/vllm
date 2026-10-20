@@ -11,7 +11,19 @@ carries TWO code planes at independent bit widths (``k_bits`` score path,
 
 Dtype grammar: ``kvarn_mla_k<k>[v<v>]_g<group>`` where ``group`` equals the
 vLLM cache block size (one tile == one page). Launched variants:
-``kvarn_mla_k4v4_g256``, ``kvarn_mla_k5v5_g256``, ``kvarn_mla_k4v2_g256``.
+``kvarn_mla_k4v4_g256``, ``kvarn_mla_k5v5_g256``, ``kvarn_mla_k4v2_g256``,
+and the SINGLE-PLANE ``kvarn_mla_k4_g256``.
+
+Single-plane (``v_bits == 0``): ONE code plane over the rotated latent --
+one RTN grid, one inline fp16 scale + zero-point -- consumed by BOTH the
+score (K) and value (V) paths through their folded projections
+(``k_hat == v_hat``). The dual-plane variants code the same latent twice at
+independent bit widths (8.25 bits/dim for k4v4); the single-plane variant is
+the shared-code point at ~4.3 bits/dim (record 264B; pool 297 B/token with
+the 33 B C4 index tail — records end exactly on the C4 boundary). The
+record keeps the dual-plane field layout with the ``v_codes`` plane empty
+(0 bytes) and ``v_scale``/``v_zp`` stored as zero, so all record offsets and
+the mod-33 geometry rule are variant-independent.
 
 Record layout (per token, latent_dim=512), little-endian:
 
@@ -72,7 +84,12 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True)
 class KvarnMlaLayout:
-    """Byte geometry of the dual-rate KVarN MLA record."""
+    """Byte geometry of the KVarN MLA record.
+
+    ``v_bits == 0`` selects the single-plane variant (one shared code plane,
+    ``v_code_bytes == 0``); otherwise the dual-rate record with independent
+    ``k_bits``/``v_bits`` planes.
+    """
 
     k_bits: int
     v_bits: int
@@ -95,15 +112,22 @@ class KvarnMlaLayout:
     def record_bytes(self) -> int:
         """Padded record width.
 
-        Beyond the 8-byte alignment, ``record_bytes % 33 <= 21`` keeps the
-        GLM C4-page alignment gap (records end -> 8448B indexer tail) at
-        >= 3072 bytes so the reserved per-tile tail region fits inside it
-        and the parent-page stride stays an exact multiple of the 8448-byte
-        C4 page (33 * 256 = 8448). The tail carries no scales under the
-        per-token record scheme but stays reserved for C4 alignment.
+        Dual-plane variants: 8-byte aligned content PLUS the mod-33 rule
+        (``0 < r % 33 <= 21``) keeps the GLM C4-page alignment gap (records
+        end -> 8448B indexer tail) at >= 3072 bytes so the reserved per-tile
+        tail region fits inside it and the parent-page stride stays an exact
+        multiple of the 8448-byte C4 page (33 * 256 = 8448).
+
+        Single-plane variants (``v_bits == 0``) carry no tile-tail data, so
+        the mod-33 bump is skipped and ``record % 33 == 0`` is allowed:
+        records end exactly on a C4 boundary and the FP8 index tail starts
+        flush (264 = 8 C4 pages for k4), removing the 25 B/token per-tile
+        slack the dual rule pads in.
         """
         content = self.k_code_bytes + self.v_code_bytes + 8
         r = (content + 7) // 8 * 8
+        if self.v_bits == 0:
+            return r
         # m == 0 puts the records end exactly on the C4 boundary (no gap);
         # require 0 < m <= 21 so the gap fits the reserved tile tail.
         while r % 33 == 0 or r % 33 > 21:
@@ -111,12 +135,19 @@ class KvarnMlaLayout:
         return r
 
     @property
+    def _tile_tail_bytes(self) -> int:
+        """Reserved per-tile tail region: dual variants reserve the legacy
+        VarN/tile-scale region; single-plane records carry every scale
+        inline and records end on the C4 boundary, so the region is zero."""
+        return 0 if self.v_bits == 0 else _KVARN_TILE_TAIL_BYTES
+
+    @property
     def tile_stride_bytes(self) -> int:
         """Kernel tile stride: one tile of ``group`` records plus the reserved
         per-tile tail region, rounded up to a whole C4 index page so the FP8
         index tail placement (which aligns to C4 pages) sees the same stride
         as the kernels."""
-        raw = self.record_bytes * self.group + _KVARN_TILE_TAIL_BYTES
+        raw = self.record_bytes * self.group + self._tile_tail_bytes
         return (
             (raw + _KVARN_INDEX_PAGE_BYTES - 1) // _KVARN_INDEX_PAGE_BYTES
         ) * _KVARN_INDEX_PAGE_BYTES
@@ -260,17 +291,25 @@ def pack_kvarn_mla_records(
         layout: record geometry.
 
     Returns:
-        ``records [T, record_bytes]`` uint8. Each record carries both code
-        planes and their inline fp16 scale/zero-point (asymmetric RTN
+        ``records [T, record_bytes]`` uint8. Each record carries the code
+        plane(s) and their inline fp16 scale/zero-point (asymmetric RTN
         per token, ninfer scheme — no tile-coupled scales, no VarN).
+        Single-plane layouts (``v_bits == 0``) carry one plane; the ``v_*``
+        fields stay zero.
     """
     tokens, latent_dim = latent.shape
     assert latent_dim == layout.latent_dim
     x = latent.to(torch.float32)
     # Score path: per-token asymmetric RTN on the rotated latent.
     k_codes, k_scale, k_zp = _rtn_codes(x, layout.k_bits, dim=1)
-    # Value path: per-token asymmetric RTN at the v_bits width.
-    v_codes, v_scale, v_zp = _rtn_codes(x, layout.v_bits, dim=1)
+    single_plane = layout.v_bits == 0
+    if single_plane:
+        # Shared-code point: no second plane; v fields stay zero and both
+        # attention paths consume k_hat through their folded projections.
+        v_codes, v_scale, v_zp = None, None, None
+    else:
+        # Value path: per-token asymmetric RTN at the v_bits width.
+        v_codes, v_scale, v_zp = _rtn_codes(x, layout.v_bits, dim=1)
     # k_hat = k_codes * k_scale + k_zp ; v_hat = v_codes * v_scale + v_zp
 
     records = torch.zeros(
@@ -280,13 +319,14 @@ def pack_kvarn_mla_records(
     records[:, layout.k_code_offset : layout.k_code_offset + layout.k_code_bytes] = (
         pack_bits(k_codes, layout.k_bits).to(torch.uint8)
     )
-    records[:, layout.v_code_offset : layout.v_code_offset + layout.v_code_bytes] = (
-        pack_bits(v_codes, layout.v_bits).to(torch.uint8)
-    )
+    if not single_plane:
+        records[
+            :, layout.v_code_offset : layout.v_code_offset + layout.v_code_bytes
+        ] = pack_bits(v_codes, layout.v_bits).to(torch.uint8)
+        rec_f16[:, layout.v_scale_offset // 2] = v_scale.to(torch.float16)
+        rec_f16[:, layout.v_zp_offset // 2] = v_zp.to(torch.float16)
     rec_f16[:, layout.k_scale_offset // 2] = k_scale.to(torch.float16)
     rec_f16[:, layout.k_zp_offset // 2] = k_zp.to(torch.float16)
-    rec_f16[:, layout.v_scale_offset // 2] = v_scale.to(torch.float16)
-    rec_f16[:, layout.v_zp_offset // 2] = v_zp.to(torch.float16)
     return records
 
 
@@ -307,18 +347,22 @@ def unpack_kvarn_mla_records(
         layout.k_bits,
         latent_dim,
     ).to(torch.float32)
+    k_scale = rec_f16[:, layout.k_scale_offset // 2].to(torch.float32)
+    k_zp = rec_f16[:, layout.k_zp_offset // 2].to(torch.float32)
+
+    # Score path: k_hat = codes * k_scale + k_zp (rotated frame).
+    k_hat = k_codes * k_scale.unsqueeze(1) + k_zp.unsqueeze(1)
+    if layout.v_bits == 0:
+        # Single-plane: the value path reads the shared k_hat codes.
+        return k_hat, k_hat
     v_codes = unpack_bits(
         records[:, layout.v_code_offset : layout.v_code_offset + layout.v_code_bytes],
         layout.v_bits,
         latent_dim,
     ).to(torch.float32)
-    k_scale = rec_f16[:, layout.k_scale_offset // 2].to(torch.float32)
-    k_zp = rec_f16[:, layout.k_zp_offset // 2].to(torch.float32)
     v_scale = rec_f16[:, layout.v_scale_offset // 2].to(torch.float32)
     v_zp = rec_f16[:, layout.v_zp_offset // 2].to(torch.float32)
 
-    # Score path: k_hat = codes * k_scale + k_zp (rotated frame).
-    k_hat = k_codes * k_scale.unsqueeze(1) + k_zp.unsqueeze(1)
     # Value path: v_hat = codes * v_scale + v_zp (rotated frame).
     v_hat = v_codes * v_scale.unsqueeze(1) + v_zp.unsqueeze(1)
 
